@@ -126,7 +126,7 @@ it('records and queues each source once and sends encrypted-push options with st
   expect(send).toHaveBeenCalledTimes(2);
   const payload = JSON.parse(send.mock.calls[0][1]!);
   expect(payload.notification).toMatchObject({
-    title: 'Rene · Project',
+    title: 'Demo agent · Project',
     body: 'New reply: Hello world',
     app_badge: '1',
   });

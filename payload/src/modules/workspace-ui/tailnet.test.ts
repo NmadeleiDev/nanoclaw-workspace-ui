@@ -14,6 +14,7 @@ let route: any;
 let child: any;
 let enabledOrigin: string | null;
 let start: Mock<(args: string[]) => ChildProcess>;
+let checkFailure: Error | null;
 beforeEach(async () => {
   const db = await initTestDb();
   await runMigrations(db);
@@ -27,6 +28,7 @@ beforeEach(async () => {
     },
   };
   enabledOrigin = null;
+  checkFailure = null;
   start = vi.fn((_args: string[]) => {
     child = Object.assign(new EventEmitter(), {
       stdout: new PassThrough(),
@@ -49,6 +51,7 @@ beforeEach(async () => {
   const cli: TailnetRuntime = {
     start,
     async json(args) {
+      if (checkFailure) throw checkFailure;
       return args[0] === 'status'
         ? { BackendState: 'Running', Self: { DNSName: 'mac.test.ts.net.', Online: true } }
         : structuredClone(route);
@@ -120,4 +123,36 @@ it('reconnects an enabled workspace after its Serve process exits', async () => 
   await vi.advanceTimersByTimeAsync(15000);
   expect(start).toHaveBeenCalledTimes(2);
   expect((await network.status()).running).toBe(true);
+});
+
+it('pauses remote authorization on a failed check without tearing down Serve, then recovers the same lease', async () => {
+  vi.useFakeTimers();
+  await network.setEnabled(true);
+  const lease = child;
+  checkFailure = new Error('Temporary Tailscale timeout');
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(enabledOrigin).toBeNull();
+  expect(lease.kill).not.toHaveBeenCalled();
+  expect((await network.status()).running).toBe(false);
+  expect(() => network.url()).toThrow('Verify Tailscale');
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(lease.kill).not.toHaveBeenCalled();
+  checkFailure = null;
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(start).toHaveBeenCalledOnce();
+  expect(enabledOrigin).toBe('https://mac.test.ts.net:8443');
+  expect((await network.status()).error).toBeNull();
+  expect((await network.status()).running).toBe(true);
+});
+it('still stops a changed or public route after a transient check failure', async () => {
+  vi.useFakeTimers();
+  await network.setEnabled(true);
+  checkFailure = new Error('Temporary timeout');
+  await vi.advanceTimersByTimeAsync(15000);
+  checkFailure = null;
+  route.AllowFunnel = { 'mac.test.ts.net:8443': true };
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(enabledOrigin).toBeNull();
+  expect(child.kill).toHaveBeenCalledOnce();
+  expect((await network.status()).running).toBe(false);
 });

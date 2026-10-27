@@ -1,4 +1,4 @@
-import { workspaceResponse } from './response';
+import { WorkspaceConnectionError, workspaceRequest } from './response';
 import { SpeechButton, SpeechSettings, type SpeechConfig } from './speech';
 import { resolveNavigation, navigationUrl, navigationKey } from './navigation';
 import { matchImportAgents } from './import-mapping';
@@ -154,7 +154,7 @@ type Detail = {
 let csrf = '';
 let displayTimezone = 'UTC';
 async function api<T = any>(url: string, method = 'GET', data?: unknown, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(`/api${url}`, {
+  return workspaceRequest<T>(`/api${url}`, {
     method,
     credentials: 'same-origin',
     signal,
@@ -164,7 +164,6 @@ async function api<T = any>(url: string, method = 'GET', data?: unknown, signal?
     },
     body: data === undefined ? undefined : JSON.stringify(data),
   });
-  return workspaceResponse<T>(response);
 }
 
 configureNotifications(api);
@@ -2187,6 +2186,7 @@ function App() {
   const [results, setResults] = useState<any[]>([]);
   const [notice, setNotice] = useState('');
   const [online, setOnline] = useState(false);
+  const [connectionIssue, setConnectionIssue] = useState('');
   const [agentMenu, setAgentMenu] = useState(false);
   const [showArchive, setShowArchive] = useState(() => localStorage.getItem('ws.show-archive') === 'true');
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() =>
@@ -2285,8 +2285,13 @@ function App() {
               : next,
           );
       }
+      setConnectionIssue('');
+      setOnline(true);
     } catch (e) {
-      notify(String(e));
+      if (e instanceof WorkspaceConnectionError) {
+        setOnline(false);
+        setConnectionIssue(e.message);
+      } else notify(String(e));
     } finally {
       loadingRefresh.current = false;
       if (pendingRefresh.current) {
@@ -3095,6 +3100,13 @@ function App() {
             )}
           </div>
         </header>
+        {connectionIssue && (
+          <div className="connection-notice" role="status">
+            <span>{connectionIssue} Reconnecting automatically. Your draft is kept.</span>
+            <button type="button" className="text-button" onClick={() => void refresh()}>Retry now</button>
+          </div>
+        )}
+
         {sessionId ? (
           <>
             <div

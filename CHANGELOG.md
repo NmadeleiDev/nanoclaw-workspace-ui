@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Keep mobile composer controls aligned, with a single-line folder path and 44-pixel touch targets.
+
+- Recover safely from connection interruptions with read-only retries, a persistent status banner and privacy-conscious request diagnostics.
+- Preserve Tailscale Serve during temporary verification failures while keeping remote authorization paused until the private route is verified.
+
 - Dictate messages locally with the optional MyWhispr CLI, including review before sending and retry after transcription failures.
 - Show recent conversations first, with latest-message previews and clearer unread badges.
 - Keep project scratchpads scrollable within a bounded preview, with a full-view option.

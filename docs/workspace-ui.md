@@ -21,3 +21,11 @@ Use the microphone beside Send to dictate a message. Stop to transcribe, review 
 Settings → Speech controls enablement, model, language and an optional absolute MyWhispr CLI path. The host discovers `mywhispr` in its user-local bin directory or PATH. This integration requires the existing MyWhispr CLI and a compatible Mac host; it does not bundle or install a transcription engine. Choose a model already installed in MyWhispr. The CLI may download missing models on first use.
 
 Desktop localhost and Tailscale HTTPS both support microphone capture. An iPhone records locally and sends audio through the paired workspace connection to the Mac for transcription. Browser microphone permission is required. Chrome/Safari audio is decoded and converted to mono 16 kHz PCM WAV in the browser. The host accepts recordings up to two minutes, serializes inference, bounds its runtime, and removes temporary audio on success, failure or cancellation. Raw recordings are not chat attachments or conversation history. Transcription is local; sending its text uses the agent’s normal provider.
+
+## Connection recovery
+
+If the workspace connection drops, background refresh shows a persistent reconnecting banner instead of repeated error toasts. Your draft stays in the composer. The app retries failed reads twice, then resumes its normal refresh cycle; Retry now checks immediately. A plain-text proxy 404 is reported as an address/routing failure, rather than proof that NanoClaw is down.
+
+Messages and other changes are never automatically retried. If their response is lost, check the conversation or setting before trying again: the action may already have completed.
+
+Tailscale health-check failures pause remote authorization while preserving the owned Serve process. Access resumes only after the private route is verified. A confirmed route change or Funnel exposure still releases that process immediately. Host logs record failed CLI checks, Serve exits and recovery; browser diagnostics record the failed request method, path and status without query strings, response bodies, credentials or message text.

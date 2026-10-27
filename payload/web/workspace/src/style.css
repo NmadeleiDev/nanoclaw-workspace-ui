@@ -4235,7 +4235,58 @@ label > textarea {
 .speech-status { font-size:.85rem; color:var(--muted); max-width:12em; }
 .speech-cancel { min-height:44px; padding:6px; color:var(--muted); font-size:.85rem; }
 .speech-enable { display:flex; align-items:center; gap:10px; }
-@media(max-width:600px) { .composer-right:has(.speech-active) { flex-wrap:wrap; } .speech-active { flex:1 1 100%; } }
+@media (max-width: 650px) {
+  .composer-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+  .composer-left,
+  .composer-right {
+    width: 100%;
+    margin: 0;
+  }
+  .composer-left > .icon-button,
+  .composer-right > .icon-button,
+  .composer-right .send-button {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    min-height: 44px;
+    flex-shrink: 0;
+  }
+  .composer-left .composer-context {
+    flex: 1;
+    min-width: 0;
+    max-width: none;
+    min-height: 44px;
+  }
+  .composer-context .directory-path {
+    display: block;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .composer-right .speech-input {
+    flex-shrink: 0;
+  }
+  .composer-right .model-selector {
+    flex: 1;
+    min-width: 0;
+    max-width: none;
+    min-height: 44px;
+  }
+  .model-selector > svg {
+    flex-shrink: 0;
+  }
+  .composer-right:has(.speech-active) {
+    flex-wrap: wrap;
+  }
+  .composer-right .speech-active {
+    flex: 1 1 100%;
+  }
+}
 
 .speech-settings { display:grid; gap:20px; }
 .speech-settings .settings-section-heading { margin-bottom:0; }
@@ -4273,3 +4324,20 @@ label > textarea {
 .latest-message-preview .preview-sender { font-weight:600; }
 .latest-message-preview.empty { color:var(--faint); }
 .recent-sessions > button.unread .latest-message-preview, .overview-sessions > button.unread .latest-message-preview { color:var(--text); }
+
+/* Persistent connection state replaces repeated background-error toasts. */
+.connection-notice {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 12px 20px;
+  flex-shrink: 0;
+  color: var(--text);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--line);
+  font-size: .875rem;
+  line-height: 1.5;
+}
+.connection-notice > span { flex: 1 1 220px; }
+.connection-notice button { min-height: 44px; flex-shrink: 0; }

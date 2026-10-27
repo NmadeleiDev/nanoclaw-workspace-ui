@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import type { WorkspaceStore } from './store.js';
 import { WorkspaceError } from './types.js';
+import { log } from '../../log.js';
 
 const exec = promisify(execFile);
 export const TAILNET_PORT = 8443;
@@ -26,8 +27,17 @@ export interface TailnetRuntime {
 }
 const runtime: TailnetRuntime = {
   async json(args) {
-    const { stdout } = await exec('tailscale', args, { timeout: 8000, maxBuffer: 4_000_000 });
-    return JSON.parse(stdout);
+    try {
+      const { stdout } = await exec('tailscale', args, { timeout: 8000, maxBuffer: 4_000_000 });
+      return JSON.parse(stdout);
+    } catch (error) {
+      const failure = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+      log.warn('Workspace Tailscale CLI check failed', {
+        check: args.join(' '), code: failure.code ?? null,
+        killed: failure.killed ?? false, signal: failure.signal ?? null,
+      });
+      throw new Error('Could not check Tailscale status. Retrying automatically.');
+    }
   },
   start(args) {
     const helper = new URL(`./tailnet-process.${import.meta.url.endsWith('.ts') ? 'ts' : 'js'}`, import.meta.url);
@@ -119,7 +129,7 @@ export class WorkspaceTailnet {
     this.watch();
   }
   private async connect(waitForPreviousHost = false): Promise<void> {
-    if (this.child && this.origin) return;
+    if (this.child && this.origin && !this.error) return;
     if (this.child) await this.release();
     let before = await this.inspect();
     if (waitForPreviousHost && this.ownsRoute(before.config, before.name)) {
@@ -147,8 +157,9 @@ export class WorkspaceTailnet {
     child.on('error', (error) => {
       failure = error;
     });
-    child.once('exit', () => {
+    child.once('exit', (code, signal) => {
       if (this.child !== child) return;
+      log.warn('Workspace Tailscale Serve exited; reconnecting', { code, signal });
       this.child = undefined;
       this.authorize(null);
       this.origin = null;
@@ -168,6 +179,7 @@ export class WorkspaceTailnet {
           this.origin = current.url;
           this.authorize(this.origin);
           this.error = null;
+          log.info('Workspace Tailscale route connected');
           return;
         }
         await new Promise((resolve) => setTimeout(resolve, 150));
@@ -186,15 +198,25 @@ export class WorkspaceTailnet {
       void this.serialize(async () => {
         if (!this.desired) return;
         try {
-          if (!this.child || !this.origin) await this.connect(true);
+          if (!this.child) await this.connect(true);
           else {
             const live = await this.inspect();
-            if (live.url !== this.origin || !this.ownsRoute(live.config, live.name))
+            if ((this.origin && live.url !== this.origin) || !this.ownsRoute(live.config, live.name)) {
+              await this.release();
               throw new Error('The Tailscale route changed or became public.');
+            }
+            if (this.error) log.info('Workspace Tailscale health check recovered');
+            this.origin = live.url;
+            this.authorize(this.origin);
+            this.error = null;
           }
         } catch (error) {
-          this.error = error instanceof Error ? error.message : String(error);
-          await this.release();
+          const reason = error instanceof Error ? error.message : String(error);
+          if (this.error !== reason) log.warn('Workspace Tailscale access paused', { reason });
+          this.error = reason;
+          // Fail closed without destroying a potentially healthy Serve lease.
+          // A later verified check restores access; confirmed unsafe routes above are released.
+          this.authorize(null);
         }
         this.changed();
       }).catch((error) => {
@@ -240,10 +262,10 @@ export class WorkspaceTailnet {
     } catch (failure) {
       error ??= failure instanceof Error ? failure.message : String(failure);
     }
-    return { enabled: this.desired, available, running: !!this.origin, url: this.origin, error, preview: this.preview };
+    return { enabled: this.desired, available, running: !!this.origin && !this.error, url: this.origin, error, preview: this.preview };
   }
   url(): string {
-    if (!this.origin) throw new WorkspaceError(409, 'Enable Tailscale access before pairing a device.');
+    if (!this.origin || this.error) throw new WorkspaceError(409, 'Verify Tailscale access before pairing a device.');
     return this.origin;
   }
   async stop() {
