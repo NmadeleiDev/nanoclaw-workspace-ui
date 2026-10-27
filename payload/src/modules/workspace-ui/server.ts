@@ -92,6 +92,7 @@ export async function startWorkspaceServer(
             '/manifest.webmanifest',
             '/sw.js',
             '/icon.svg',
+            '/favicon.ico',
             '/icon-192.png',
             '/icon-512.png',
             '/apple-touch-icon.png',
@@ -110,6 +111,7 @@ export async function startWorkspaceServer(
           '.woff2': 'font/woff2',
           '.svg': 'image/svg+xml',
           '.png': 'image/png',
+          '.ico': 'image/x-icon',
           '.webmanifest': 'application/manifest+json',
         };
         res.writeHead(200, { 'Content-Type': mime[path.extname(file)] ?? 'application/octet-stream' });

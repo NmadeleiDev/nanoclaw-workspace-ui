@@ -6,7 +6,7 @@ self.addEventListener('install', event => event.waitUntil((async () => {
   if(!shell.ok)throw new Error('Workspace shell unavailable');
   const html=await shell.clone().text();await cache.put('/',shell);
   const assets=[...html.matchAll(/(?:src|href)="(\/assets\/[^"?#]+)"/g)].map(m=>m[1]);
-  await cache.addAll([...new Set([...assets,'/icon-192.png','/icon-512.png','/apple-touch-icon.png'])]);
+  await cache.addAll([...new Set([...assets,'/icon.svg','/favicon.ico','/icon-192.png','/icon-512.png','/apple-touch-icon.png'])]);
 } )()));
 self.addEventListener('activate',event=>event.waitUntil((async()=>{for(const key of await caches.keys())if(key.startsWith('nanoclaw-shell-')&&key!==CACHE)await caches.delete(key);await self.clients.claim();})()));
 self.addEventListener('message',event=>{if(event.data?.type==='activate')self.skipWaiting();});
@@ -16,7 +16,7 @@ self.addEventListener('fetch',event=>{
   if(event.request.mode==='navigate'&&url.pathname==='/') {
     event.respondWith(fetch(event.request).catch(async()=>{const cached=await caches.match('/');return cached??Response.error();}));return;
   }
-  if(url.pathname.startsWith('/assets/')||/^\/(icon-(192|512)\.png|apple-touch-icon\.png)$/.test(url.pathname))event.respondWith((async()=>{
+  if(url.pathname.startsWith('/assets/')||/^\/(icon-(192|512)\.png|apple-touch-icon\.png|icon\.svg|favicon\.ico)$/.test(url.pathname))event.respondWith((async()=>{
     const cached=await caches.match(event.request);if(cached)return cached;
     const response=await fetch(event.request);if(response.ok)(await caches.open(CACHE)).put(event.request,response.clone());return response;
   })());
