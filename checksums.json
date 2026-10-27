@@ -3,10 +3,10 @@
   ".github/ISSUE_TEMPLATE/config.yml": "75aa030b990ebd432f835a22a437d324b4a6a55bc37fada92623f8b1223a2bb2",
   ".github/ISSUE_TEMPLATE/feature.yml": "d1d5cdefe470d77ee2d946c418384b114e528727064333a4b8bf8630e9dcab5c",
   ".github/pull_request_template.md": "8a43b7fe70249160f018438e3c4dae8e82b3af046b469bbdc78638d9f42f289d",
-  ".github/workflows/ci.yml": "b233a2ab40581dba544e37e076715715a72db2f890837a4f3544f55db24549ac",
+  ".github/workflows/ci.yml": "d633e48f54135168ae56ccaf9aef8706e0ad6cdac4fcbe1a099c0552bba1868b",
   ".gitignore": "58aea3d6b4b0f8799c1e00c3b023898516997f6369ee8e13d8d4b4215f70a62b",
   "CHANGELOG.md": "c11530c5722ae48c0834f57ba6e1eccae195b6aa0131369eea369844a07f14dd",
-  "CONTRIBUTING.md": "aa189453f8bd3b774405caeeb8fc33b1bfae2795eb553a4839101fa4961f0084",
+  "CONTRIBUTING.md": "c6885d5fb076e5f21d1818bb7ad372c0c092da76c5373e0de278a667dbe4bab5",
   "LICENSE": "d20135a5de128506f70407bdcd22f8c49862187a5c46da81b34b9ed91085a480",
   "README.md": "c186bf36393169d4a088698974634d1b18250820547d85223055fc0b8e0e646f",
   "REMOVE.md": "de8c75869d832488843ef190ea4851a3b590e09ea6104bf1d4b12ec98950447a",
@@ -107,6 +107,6 @@
   "payload/web/workspace/vite.config.ts": "e985dd60cdee94a9273e115858e9d4207f41d8269d01d7001cb2bba5f6f5df41",
   "release-files.json": "c8cb34906faea60246146f6f30a2e581333b2ec5f2fcb9040376c3c65cf8fab5",
   "release.mjs": "e698e1e3230ca374ea40180b37c6550abbaf2eb80a07ae23ad4f5f5d6cad7d9e",
-  "tests/install.test.mjs": "025c3c82e88d259e6c26f7670443f024567aa712693041d8903128602d60bc4a",
+  "tests/install.test.mjs": "390d03dc456cdef412be97270a7a12cdf8467150ff25aaf5836847a7cc9f6209",
   "tests/release.test.mjs": "ed1365f92f80379c49b0b42ea081ee8870a02aa93001a96e6d8330e899784103"
 }

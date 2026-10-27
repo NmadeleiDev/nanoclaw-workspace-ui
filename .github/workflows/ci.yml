@@ -40,6 +40,7 @@ jobs:
         working-directory: addon
         env:
           WORKSPACE_UI_UPSTREAM: ${{ github.workspace }}/upstream
+          WORKSPACE_UI_TEST_ROOT: ${{ runner.temp }}/wsui
         run: |
           node release.mjs --check
           node --test tests/*.test.mjs

@@ -10,9 +10,10 @@ const release = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const upstream = process.env.WORKSPACE_UI_UPSTREAM ?? path.resolve(release, '../..');
 const commit = JSON.parse(fs.readFileSync(path.join(release, 'compatibility.json'))).upstreamCommit;
 const manifest = JSON.parse(fs.readFileSync(path.join(release, 'manifest.json')));
-fs.mkdirSync(path.join(upstream, '.cache'), { recursive: true });
+const scratch = process.env.WORKSPACE_UI_TEST_ROOT ?? path.join(upstream, '.cache');
+fs.mkdirSync(scratch, { recursive: true });
 function fixture() {
-  const root = fs.mkdtempSync(path.join(upstream, '.cache/workspace-ui-install-'));
+  const root = fs.mkdtempSync(path.join(scratch, 'workspace-ui-install-'));
   const archive = execFileSync('git', ['-C', upstream, 'archive', commit], { maxBuffer: 100 * 1024 * 1024 });
   const unpack = spawnSync('tar', ['-xf', '-', '-C', root], { input: archive });
   assert.equal(unpack.status, 0);

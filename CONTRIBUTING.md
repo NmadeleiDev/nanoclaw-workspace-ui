@@ -19,6 +19,8 @@ node install.mjs --target /path/to/disposable-nanoclaw --apply
 
 In the disposable target, resolve the lockfile, install frozen dependencies, then run the host and frontend builds and focused tests shown in the installation guide. Runner changes also require the runner typecheck and Bun regression tests. UI changes need desktop and narrow-screen browser verification, keyboard access, readable text and a real workflow test.
 
+Installer tests create Unix sockets. On deeply nested checkout paths, set `WORKSPACE_UI_TEST_ROOT` to a short temporary directory you own; each fixture is removed after its test.
+
 Edit owned source in `payload/`. Keep integration changes in `integration.patch`; optional provider compatibility belongs in `optional/`. New owned files must be listed in `manifest.json`; every distributable file must be listed in `release-files.json`.
 
 After reviewing intentional source changes, run `node release.mjs --refresh`, then the checks and `node release.mjs --build`. Checksum refresh is not a substitute for reviewing the diff.
