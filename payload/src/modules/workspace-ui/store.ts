@@ -1,3 +1,4 @@
+import { parseSpeech } from './speech.js';
 import { randomUUID } from 'node:crypto';
 import type { DbDriver } from '../../db/driver.js';
 import { APPEARANCE_MODES, THEME_PRESETS } from './appearance.js';
@@ -75,6 +76,7 @@ export class WorkspaceStore {
     if (typeof value.ambientMotion !== 'boolean') throw new WorkspaceError(400, 'Invalid ambient motion setting.');
     if (typeof value.enabled !== 'boolean' || typeof value.automaticSummaries !== 'boolean')
       throw new WorkspaceError(400, 'Invalid settings.');
+    value.speech = parseSpeech(value.speech);
     value.utility = parseProfile(value.utility);
     value.overrides = Object.fromEntries(
       Object.entries(value.overrides).map(([key, profile]) => {

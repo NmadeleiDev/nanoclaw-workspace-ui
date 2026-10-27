@@ -1,3 +1,4 @@
+import { DEFAULT_SPEECH, SpeechTranscriber, speechAudio, speechStatus } from './speech.js';
 import { getProviderHostContract } from '../../provider-contracts/registry.js';
 import { agentModelSettings, updateAgentModelSettings } from '../../agent-model-settings.js';
 import { listModelConnections, removeModelConnection, saveModelConnection, seedEnvironmentConnection, parseConnection, ModelSettingsError } from '../../model-connections.js';
@@ -42,6 +43,7 @@ export async function startWorkspaceServer(
     await seedEnvironmentConnection();
     await service.store.db.run('INSERT INTO ws_settings (id,value) VALUES (?,?) ON CONFLICT(id) DO NOTHING','model-connections-imported',new Date().toISOString());
   }
+  const speech = new SpeechTranscriber(path.join(service.filesRoot, '.dictation'));
   const auth = new WorkspaceAuth(port, service.store.db);
   await service.notifications.start();
   const importer = new OpenClawImporter(service.store, service.filesRoot, () => service.changed());
@@ -121,6 +123,15 @@ export async function startWorkspaceServer(
       }
       const principal = await auth.authorize(req, !['GET', 'HEAD'].includes(method), res);
       if (!(await isOwner(principal.ownerId))) throw new WorkspaceError(403, 'Owner access has been revoked.');
+      if (route === '/api/speech' && method === 'GET') return json(speechStatus((await service.store.settings()).speech ?? DEFAULT_SPEECH));
+      if (route === '/api/speech/transcribe' && method === 'POST') {
+        if (!service.bridge) throw new WorkspaceError(403, 'Speech input is unavailable in preview.');
+        const controller = new AbortController();
+        const cancel = () => { if (!res.writableEnded) controller.abort(); };
+        res.on('close', cancel);
+        try { return json(await speech.transcribe(speechAudio((await body(req)).audio), (await service.store.settings()).speech ?? DEFAULT_SPEECH, controller.signal)); }
+        finally { res.off('close', cancel); }
+      }
       const agentFileRoute = /^\/api\/agents\/([^/]+)\/(skills|files)(?:\/(content|[a-f0-9]{64}))?$/.exec(route);
       if (agentFileRoute && method === 'GET') {
         let agentId: string;
@@ -208,6 +219,10 @@ export async function startWorkspaceServer(
       if (route === '/api/devices' && method === 'GET')
         return json(await service.notifications.devices(principal.ownerId));
       const deviceMatch = /^\/api\/devices\/([^/]+)$/.exec(route);
+      if (deviceMatch && method === 'DELETE') {
+        await service.notifications.removeDevice(principal.ownerId, deviceMatch[1]);
+        return json({ ok: true });
+      }
       if (deviceMatch && method === 'PATCH') {
         await service.notifications.updateDevice(principal.ownerId, deviceMatch[1], await body(req));
         return json({ ok: true });

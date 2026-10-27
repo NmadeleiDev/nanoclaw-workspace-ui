@@ -263,6 +263,19 @@ export class WorkspaceNotifications {
     }
     this.changed();
   }
+  async removeDevice(owner: string, id: string) {
+    await this.store.db.transaction(async () => {
+      const device = await this.store.db.get<{ revoked_at: string | null }>(
+        'SELECT revoked_at FROM ws_devices WHERE id=? AND owner_id=?', id, owner,
+      );
+      if (!device) throw new WorkspaceError(404, 'Device not found.');
+      if (!device.revoked_at) throw new WorkspaceError(409, 'Disconnect this device before removing it.');
+      await this.store.db.run('DELETE FROM ws_devices WHERE id=? AND owner_id=? AND revoked_at IS NOT NULL', id, owner);
+    });
+    for (const [key, presence] of this.presence) if (presence.deviceId === id) this.presence.delete(key);
+    this.changed();
+  }
+
   async subscribe(owner: string, id: string, value: unknown) {
     const subscription = validateSubscription(value);
     const device = await this.store.db.get<Device>(
@@ -342,7 +355,14 @@ export class WorkspaceNotifications {
       }
       if (preference.enabled && preference.global.kinds[row.kind]) badge += row.count;
     }
-    return { items, badge };
+    // Message unread state is independent of push preferences and the 200-item activity page.
+    const replies = await this.store.db.all<{ session_id: string; count: number }>(
+      `SELECT a.session_id,COUNT(*) AS count FROM ws_activity a
+       LEFT JOIN ws_activity_read r ON r.activity_id=a.id AND r.owner_id=?
+       WHERE r.activity_id IS NULL AND a.kind='reply' GROUP BY a.session_id`, owner,
+    );
+    const unreadBySession = Object.fromEntries(replies.map(row => [row.session_id, row.count]));
+    return { items, badge, unreadBySession };
   }
   async record(
     session: WorkspaceSession,

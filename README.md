@@ -17,6 +17,7 @@ Organize NanoClaw conversations into projects, give agents the right working fol
 | --- | --- |
 | **Projects with context** | A name, brief, working folders and shared scratchpad that travel with your conversations. |
 | **Flexible conversations** | Inherit project folders or choose your own. Select a model, paste images, or drop files into chat. |
+| **Local dictation** | Optional MyWhispr speech input with review before sending, on desktop or iPhone. |
 | **Living notes** | Session and project scratchpads with background summaries and revision history. |
 | **Your agents, your models** | Edit agent defaults and API connection metadata in Settings. Credentials stay in NanoClaw’s gateway. |
 | **Made for daily use** | Search, activity, readable system fonts, text-size controls, themes and responsive layouts. |

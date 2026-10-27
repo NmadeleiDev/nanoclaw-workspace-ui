@@ -67,7 +67,7 @@ export const Bell = ({ muted = false }: { muted?: boolean }) => (
 );
 export function useNotifications(enabled = true) {
   const [settings, setSettings] = useState<NotificationData | null>(null);
-  const [feed, setFeed] = useState<{ items: Activity[]; badge: number }>({ items: [], badge: 0 });
+  const [feed, setFeed] = useState<{ items: Activity[]; badge: number; unreadBySession: Record<string, number> }>({ items: [], badge: 0, unreadBySession: {} });
   const [error, setError] = useState('');
   const loading = useRef(false);
   const refresh = async () => {
@@ -76,7 +76,7 @@ export function useNotifications(enabled = true) {
     try {
       const [next, activity] = await Promise.all([
         request<NotificationData>('/notifications'),
-        request<{ items: Activity[]; badge: number }>('/notifications/activity'),
+        request<{ items: Activity[]; badge: number; unreadBySession: Record<string, number> }>('/notifications/activity'),
       ]);
       setSettings(next);
       setFeed(activity);
@@ -310,7 +310,7 @@ function DeviceCard({
   const [name, setName] = useState(device.name);
   const [confirm, setConfirm] = useState(false);
   return (
-    <div className="notification-device">
+    <div className="notification-device" role="group" aria-label={device.name}>
       <div>
         <strong>
           {device.name}
@@ -357,7 +357,14 @@ function DeviceCard({
           </button>
         </div>
       )}
-      {renaming && (
+      {!!device.revoked_at && (
+        <div className="notification-device-actions">
+          <button type="button" className="text-button" onClick={() => setConfirm(!confirm)}>
+            Remove
+          </button>
+        </div>
+      )}
+      {renaming && !device.revoked_at && (
         <form
           className="notification-inline"
           onSubmit={(e) => {
@@ -372,16 +379,19 @@ function DeviceCard({
       )}
       {confirm && (
         <div className="notification-confirm">
-          <span>Disconnect {current ? 'this device' : device.name}? A new pairing will be needed.</span>
+          <span>{device.revoked_at ? `Remove ${device.name} from the device list? It is already disconnected.` : `Disconnect ${current ? 'this device' : device.name}? A new pairing will be needed.`}</span>
           <button
             className="button secondary small"
             onClick={() => {
-              run(() => mutate(`/devices/${device.id}`, { revoked: true }, 'PATCH'));
+              run(() => device.revoked_at
+                ? mutate(`/devices/${device.id}`, undefined, 'DELETE')
+                : mutate(`/devices/${device.id}`, { revoked: true }, 'PATCH'));
               setConfirm(false);
             }}
           >
-            Disconnect device
+            {device.revoked_at ? 'Remove device' : 'Disconnect device'}
           </button>
+          <button type="button" className="text-button" onClick={() => setConfirm(false)}>Cancel</button>
         </div>
       )}
     </div>
@@ -661,7 +671,7 @@ export function ActivityInbox({
   choose,
   openSettings,
 }: {
-  feed: { items: Activity[]; badge: number };
+  feed: { items: Activity[]; badge: number; unreadBySession: Record<string, number> };
   settings: NotificationData | null;
   choose: (id: string, activityId: string) => void;
   openSettings: () => void;

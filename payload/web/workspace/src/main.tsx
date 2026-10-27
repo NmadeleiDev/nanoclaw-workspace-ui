@@ -1,3 +1,5 @@
+import { workspaceResponse } from './response';
+import { SpeechButton, SpeechSettings, type SpeechConfig } from './speech';
 import { resolveNavigation, navigationUrl, navigationKey } from './navigation';
 import { matchImportAgents } from './import-mapping';
 import { useChatAttachments, fileSize, transferFiles } from './attachments';
@@ -40,6 +42,7 @@ import { formatLocalTime } from '../../../src/timezone.js';
 type Project = { id: string; name: string; description: string; directories: Directory[]; archived: boolean };
 type Directory = { id: string; path: string; readonly: boolean };
 type Session = {
+  latestMessage?: { role: 'user' | 'assistant'; text: string; sender: string | null; timestamp: string } | null;
   runtimeDriver?: string | null;
   id: string;
   agentId: string;
@@ -103,6 +106,7 @@ type Message = {
 type Doc = { markdown: string; revision: number; author: string; updatedAt: string };
 type Profile = { provider: 'ollama' | 'apple' | 'agent'; model?: string; endpoint?: string; agentId?: string };
 type Settings = WorkspaceAppearance & {
+  speech: SpeechConfig;
   utility: Profile;
   overrides: Record<string, Profile>;
   automaticSummaries: boolean;
@@ -160,9 +164,7 @@ async function api<T = any>(url: string, method = 'GET', data?: unknown, signal?
     },
     body: data === undefined ? undefined : JSON.stringify(data),
   });
-  const value = await response.json();
-  if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
-  return value;
+  return workspaceResponse<T>(response);
 }
 
 configureNotifications(api);
@@ -1098,7 +1100,23 @@ function ProjectForm({
   );
 }
 
+function LatestMessagePreview({ session, agents }: { session: Session; agents: Agent[] }) {
+  const message = session.latestMessage;
+  const sender = message?.sender ?? (message?.role === 'assistant' ? agents.find(agent => agent.id === session.agentId)?.name ?? 'Agent' : 'You');
+  return <span className={`latest-message-preview ${message ? '' : 'empty'}`} title={message ? `${sender}: ${message.text}` : undefined}>
+    {message ? <><span className="preview-sender">{sender}:</span> {message.text}</> : 'No messages yet'}
+  </span>;
+}
+
+function UnreadBadge({ count, verbose = false }: { count: number; verbose?: boolean }) {
+  if (!(count > 0)) return null;
+  return <span className="session-unread-badge" aria-label={`${count} unread ${count === 1 ? 'message' : 'messages'}`} title={`${count} unread ${count === 1 ? 'message' : 'messages'}`}>
+    {count > 99 ? '99+' : count}{verbose ? ' new' : ''}
+  </span>;
+}
+
 function Scratchpad({
+  bounded = false,
   scope,
   id,
   notify,
@@ -1108,6 +1126,7 @@ function Scratchpad({
 }: {
   version?: number;
   scope: 'session' | 'project';
+  bounded?: boolean;
   id: string;
   notify: (s: string) => void;
   jobs: Bootstrap['jobs'];
@@ -1116,6 +1135,7 @@ function Scratchpad({
   const [doc, setDoc] = useState<Doc | null>(null);
   const [draft, setDraft] = useState('');
   const [editing, setEditing] = useState(false);
+  const [fullPreview, setFullPreview] = useState(false);
   const [history, setHistory] = useState<Doc[] | null>(null);
   const [selected, setSelected] = useState<Doc | null>(null);
   const [saving, setSaving] = useState(false);
@@ -1128,6 +1148,7 @@ function Scratchpad({
   useEffect(() => {
     setEditing(false);
     setDoc(null);
+    setFullPreview(false);
     void api<Doc>(`/documents/${scope}/${id}`)
       .then((value) => {
         setDoc(value);
@@ -1229,7 +1250,16 @@ function Scratchpad({
           </div>
         </>
       ) : doc.markdown ? (
-        <RichText text={doc.markdown} />
+        bounded ? (
+          <>
+            <div className="scratchpad-bounded-preview" role="region" aria-label="Project scratchpad preview" tabIndex={0}>
+              <RichText text={doc.markdown} />
+            </div>
+            <button type="button" className="text-button scratchpad-open-full" onClick={() => setFullPreview(true)}>
+              Open full scratchpad
+            </button>
+          </>
+        ) : <RichText text={doc.markdown} />
       ) : (
         <div className="scratch-empty">
           <span className="note-illustration">
@@ -1305,6 +1335,13 @@ function Scratchpad({
                 ? `Retry scheduled · ${job.error}`
                 : 'Overview update queued'}
         </div>
+      )}
+      {fullPreview && doc && (
+        <Dialog title="Project scratchpad" wide close={() => setFullPreview(false)}>
+          <div className="form-body scratchpad-full-preview" role="region" aria-label="Full project scratchpad" tabIndex={0}>
+            <RichText text={doc.markdown} />
+          </div>
+        </Dialog>
       )}
       {history && (
         <Dialog
@@ -1693,6 +1730,7 @@ const workspaceSettingsCategories = [
   ['agents', 'chat', 'Agents'],
   ['connections', 'globe', 'API connections'],
   ['models', 'spark', 'Utility models'],
+  ['speech', 'chat', 'Speech'],
   ['appearance', 'sun', 'Appearance'],
   ['network', 'globe', 'Access'],
   ['notifications', 'bell', 'Notifications'],
@@ -1802,6 +1840,7 @@ function WorkspaceSettings({
         <div className="settings-content" role="region" aria-label="Settings content" tabIndex={0}>
           {tab === 'agents' && <React.Suspense fallback={<p role="status">Loading agent settings…</p>}><AgentModelSettings agents={data.agents} request={api} onSaved={refresh} /></React.Suspense>}
           {tab === 'connections' && <React.Suspense fallback={<p role="status">Loading API connections…</p>}><ApiConnectionSettings agents={data.agents} request={api} onSaved={refresh} /></React.Suspense>}
+          {tab === 'speech' && <SpeechSettings value={settings.speech} change={speech=>setSettings({...settings,speech})} request={api} />}
           {tab === 'network' && <NetworkSettings notify={notify} />}
           {tab === 'notifications' && <NotificationSettings data={data} />}
           {tab === 'models' && (
@@ -2103,7 +2142,7 @@ function WorkspaceSettings({
         <button title="Close without saving model or appearance changes" className="button secondary" onClick={close}>
           Close
         </button>
-        {(tab === 'models' || tab === 'appearance') && (
+        {(tab === 'models' || tab === 'appearance' || tab === 'speech') && (
           <button
             title="Save utility model and appearance settings"
             className="button primary"
@@ -2154,11 +2193,14 @@ function App() {
     JSON.parse(localStorage.getItem('ws.collapsed') ?? '{}'),
   );
   const [draft, setDraft] = useState('');
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
   const { files: attachments, add: addFiles, remove: removeAttachment, clear: clearAttachments, reading: readingAttachments } = useChatAttachments(sessionId, message => notify(message));
   const [draggingFiles, setDraggingFiles] = useState(false);
   const fileDragDepth = useRef(0);
   const activeSession = useRef(sessionId); activeSession.current = sessionId;
   const [sending, setSending] = useState(false);
+  const [speechBusy, setSpeechBusy] = useState(false);
   const [rename, setRename] = useState('');
   const [creatingSession, setCreatingSession] = useState(false);
   const creationPending = useRef(false);
@@ -2494,7 +2536,7 @@ function App() {
     localStorage.setItem(`ws.draft:${sessionId ?? `new:${agentId}`}`, text);
   };
   const send = async () => {
-    if (!sessionId || sending || readingAttachments || (!draft.trim() && !attachments.length)) return;
+    if (!sessionId || sending || speechBusy || readingAttachments || (!draft.trim() && !attachments.length)) return;
     const submissionSession = sessionId;
     const payloadAttachments = attachments.map(({name,data,mimeType})=>({name,data,mimeType}));
     setSending(true);
@@ -2592,6 +2634,7 @@ function App() {
   const project = data.projects.find((p) => p.id === (current?.projectId ?? projectId));
   const agentSessions = data.sessions.filter((s) => s.agentId === agent?.id && (showArchive || !s.archived));
   const pinned = agentSessions.filter((s) => s.pinned);
+  const unreadCount = (id: string) => notifications.feed.unreadBySession?.[id] ?? 0;
   const openProjectForm = (p?: Project) => {
     setEditProject(p);
     setModal('project');
@@ -2599,7 +2642,7 @@ function App() {
   const sessionRow = (s: Session) => (
     <div className="sidebar-session" key={s.id}>
     <button
-      className={`session-row ${sessionId === s.id ? 'selected' : ''}`}
+      className={`session-row ${sessionId === s.id ? 'selected' : ''} ${unreadCount(s.id) ? 'unread' : ''}`}
       title={`Open ${s.archived ? 'archived chat' : 'chat'}: ${s.title}`}
       onClick={() => choose(s)}
     >
@@ -2607,6 +2650,7 @@ function App() {
         className={`session-dot ${data.runtime.find((r) => r.id === s.nativeSessionId)?.container_status === 'running' ? 'running' : ''}`}
       />
       <span>{s.title}</span>
+      <UnreadBadge count={unreadCount(s.id)} />
       {s.archived && (
         <span
           className="archived-mark"
@@ -3172,7 +3216,7 @@ function App() {
                               )}
                               <strong>
                                 {message.role === 'user'
-                                  ? (message.data?.sender ?? (message.source === 'agent' ? 'Agent' : 'You'))
+                                  ? (message.source === 'web' ? 'You' : (message.data?.sender ?? (message.source === 'agent' ? 'Agent' : 'You')))
                                   : message.role === 'tool'
                                     ? (message.data?.toolName ?? 'Tool result')
                                     : agent?.name}
@@ -3395,6 +3439,22 @@ function App() {
                       </button>
                     </div>
                     <div className="composer-right">
+                      <SpeechButton
+                        key={sessionId}
+                        config={data.settings.speech}
+                        request={api}
+                        disabled={sending}
+                        onBusy={setSpeechBusy}
+                        notify={notify}
+                        onText={text => {
+                          const previous = draftRef.current;
+                          const next = previous + (previous && !/\s$/.test(previous) ? ' ' : '') + text;
+                          setDraft(next);
+                          try { localStorage.setItem(`ws.draft:${sessionId}`, next); }
+                          catch { notify('Transcript added, but browser draft storage is full. Keep this conversation open until sending.'); }
+                          composer.current?.focus();
+                        }}
+                      />
                       <button
                         className="model-selector"
                         title="Change the model and reasoning effort for this conversation"
@@ -3427,7 +3487,7 @@ function App() {
                         title="Send your message and attachments"
                         className="send-button"
                         aria-label="Send message"
-                        disabled={sending || readingAttachments || (!draft.trim() && !attachments.length)}
+                        disabled={sending || speechBusy || readingAttachments || (!draft.trim() && !attachments.length)}
                         onClick={() => void send()}
                       >
                         <Icon name="send" size={18} />
@@ -3524,7 +3584,7 @@ function App() {
                               (allProjectAgents || s.agentId === agent?.id),
                           )
                           .map((s) => (
-                            <button title={`Open conversation: ${s.title}`} key={s.id} onClick={() => choose(s)}>
+                            <button className={unreadCount(s.id) ? 'unread' : ''} title={`Open conversation: ${s.title}`} key={s.id} onClick={() => choose(s)}>
                               <Avatar agent={data.agents.find((a) => a.id === s.agentId)} small />
                               <span>
                                 <strong>{s.title}</strong>
@@ -3532,14 +3592,17 @@ function App() {
                                   {data.agents.find((a) => a.id === s.agentId)?.name}
                                   {s.origin === 'openclaw' ? ' · OpenClaw' : ''}
                                 </small>
+                                <LatestMessagePreview session={s} agents={data.agents} />
                               </span>
-                              <time>{ago(s.updatedAt)}</time>
+                              <UnreadBadge count={unreadCount(s.id)} verbose />
+                              <time title={fullTime(s.latestMessage?.timestamp ?? s.updatedAt)}>{ago(s.latestMessage?.timestamp ?? s.updatedAt)}</time>
                               <Icon name="chevron" size={14} />
                             </button>
                           ))}
                       </div>
                     </div>
                     <Scratchpad
+                      bounded
                       scope="project"
                       id={project.id}
                       version={data.documentVersions?.[`project:${project.id}`]}
@@ -3550,6 +3613,27 @@ function App() {
                 </>
               ) : (
                 <>
+                  <div className="overview-section-heading">
+                    <h3>Pick up where you left off</h3>
+                    <span className="muted">Recent conversations</span>
+                  </div>
+                  <div className="recent-sessions">
+                    {agentSessions.slice(0, 6).map((s) => (
+                      <button className={unreadCount(s.id) ? 'unread' : ''} title={`Resume conversation: ${s.title}`} key={s.id} onClick={() => choose(s)}>
+                        <span className="recent-icon">
+                          <Icon name="chat" size={17} />
+                        </span>
+                        <span>
+                          <strong>{s.title}</strong>
+                          <small>{data.projects.find((p) => p.id === s.projectId)?.name ?? 'Unassigned'}</small>
+                          <LatestMessagePreview session={s} agents={data.agents} />
+                        </span>
+                        <UnreadBadge count={unreadCount(s.id)} verbose />
+                        <time title={fullTime(s.latestMessage?.timestamp ?? s.updatedAt)}>{ago(s.latestMessage?.timestamp ?? s.updatedAt)}</time>
+                        <Icon name="chevron" size={14} />
+                      </button>
+                    ))}
+                  </div>
                   <div className="overview-section-heading">
                     <h3>Projects</h3>
                     <button
@@ -3611,25 +3695,6 @@ function App() {
                   </div>
                   {agent && <AgentFiles key={`files:${agent.id}`} agentId={agent.id} />}
                   {agent && <AgentSkills key={agent.id} agentId={agent.id} />}
-                  <div className="overview-section-heading">
-                    <h3>Pick up where you left off</h3>
-                    <span className="muted">Recent conversations</span>
-                  </div>
-                  <div className="recent-sessions">
-                    {agentSessions.slice(0, 6).map((s) => (
-                      <button title={`Resume conversation: ${s.title}`} key={s.id} onClick={() => choose(s)}>
-                        <span className="recent-icon">
-                          <Icon name="chat" size={17} />
-                        </span>
-                        <span>
-                          <strong>{s.title}</strong>
-                          <small>{data.projects.find((p) => p.id === s.projectId)?.name ?? 'Unassigned'}</small>
-                        </span>
-                        <time>{ago(s.updatedAt)}</time>
-                        <Icon name="chevron" size={14} />
-                      </button>
-                    ))}
-                  </div>
                 </>
               )}
             </div>

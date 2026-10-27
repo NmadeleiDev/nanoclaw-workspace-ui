@@ -4227,3 +4227,49 @@ label > textarea {
 .draft-attachment button:hover {background:var(--surface-3);color:var(--text);}
 .attachment-vision-warning {font-size:.8125rem;line-height:1.55;margin:8px 16px;color:var(--warning);}
 .attachment-status {position:absolute;width:1px;height:1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap;}
+
+/* Dictation shares the composer toolbar and remains usable at large text sizes. */
+.speech-input { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.speech-input .icon-button { display:grid; place-items:center; min-width:44px; min-height:44px; border-radius:12px; color:var(--muted); }
+.speech-active .icon-button { color:var(--accent); background:var(--surface-2); }
+.speech-status { font-size:.85rem; color:var(--muted); max-width:12em; }
+.speech-cancel { min-height:44px; padding:6px; color:var(--muted); font-size:.85rem; }
+.speech-enable { display:flex; align-items:center; gap:10px; }
+@media(max-width:600px) { .composer-right:has(.speech-active) { flex-wrap:wrap; } .speech-active { flex:1 1 100%; } }
+
+.speech-settings { display:grid; gap:20px; }
+.speech-settings .settings-section-heading { margin-bottom:0; }
+.speech-settings p { margin:0; line-height:1.6; color:var(--muted); font-size:.9rem; }
+.settings-content .speech-settings label { display:grid; gap:8px; margin:0; }
+.settings-content .speech-settings .speech-enable { display:flex; align-items:center; justify-content:flex-start; gap:12px; color:var(--text); }
+.settings-content .speech-enable input[type="checkbox"] { width:20px; height:20px; min-height:20px; flex:0 0 20px; margin:0; accent-color:var(--accent); }
+
+/* Keep project notes readable without letting them consume the overview. */
+.project-overview-grid { align-items: start; }
+.scratchpad-bounded-preview {
+  max-height: min(26rem, 55dvh);
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding-right: 12px;
+  min-width: 0;
+}
+.scratchpad-open-full { margin-top: 14px; min-height: 44px; }
+.scratchpad-full-preview { min-height: 0; overscroll-behavior: contain; }
+.scratchpad .scratchpad-full-preview .markdown { font-size: 1rem; }
+
+/* Unread replies are distinct from the green running-agent indicator. */
+.session-row.unread { color:var(--text); font-weight:650; }
+.session-row.unread:not(.selected) { background:color-mix(in srgb, var(--accent) 10%, transparent); }
+.session-row.unread::before { content:''; position:absolute; left:7px; top:25%; height:50%; width:3px; border-radius:3px; background:var(--accent); }
+.session-unread-badge { display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; min-width:24px; min-height:24px; padding:2px 7px; border-radius:8px; background:var(--accent); color:var(--accent-text); font-size:.75rem; font-weight:700; line-height:1.25; white-space:nowrap; }
+.recent-sessions > button.unread, .overview-sessions > button.unread { background:color-mix(in srgb, var(--accent) 9%, transparent); border-radius:8px; box-shadow:inset 3px 0 var(--accent); }
+.recent-sessions > button.unread strong, .overview-sessions > button.unread strong { font-weight:700; }
+.recent-sessions > button.unread .recent-icon { color:var(--accent); background:var(--accent-bg); }
+.recent-sessions > button > .session-unread-badge, .overview-sessions > button > .session-unread-badge { margin-left:4px; }
+
+.latest-message-preview { display:block; margin-top:7px; color:var(--muted); font-size:.85rem; line-height:1.5; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.latest-message-preview .preview-sender { font-weight:600; }
+.latest-message-preview.empty { color:var(--faint); }
+.recent-sessions > button.unread .latest-message-preview, .overview-sessions > button.unread .latest-message-preview { color:var(--text); }

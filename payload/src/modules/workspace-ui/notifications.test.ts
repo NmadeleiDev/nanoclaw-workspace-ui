@@ -30,8 +30,8 @@ beforeEach(async () => {
   await db.run(
     'INSERT INTO agent_groups (id,name,folder,created_at) VALUES (?,?,?,?)',
     'agent',
-    'Assistant',
-    'assistant',
+    'Demo agent',
+    'demo-agent',
     stamp(),
   );
   await db.run(
@@ -126,7 +126,7 @@ it('records and queues each source once and sends encrypted-push options with st
   expect(send).toHaveBeenCalledTimes(2);
   const payload = JSON.parse(send.mock.calls[0][1]!);
   expect(payload.notification).toMatchObject({
-    title: 'Assistant · Project',
+    title: 'Rene · Project',
     body: 'New reply: Hello world',
     app_badge: '1',
   });
@@ -276,4 +276,33 @@ it('counts all eligible unread activity rather than only the visible recent page
   const feed = await notifications.activity('owner');
   expect(feed.items).toHaveLength(200);
   expect(feed.badge).toBe(205);
+  expect(feed.unreadBySession).toEqual({ [session.id]: 205 });
+});
+
+it('tracks unread replies independently of muting, other activity, age and other owners', async () => {
+  await notifications.savePreference('owner', 'global', '', { mode: 'muted' });
+  await record('reply', 'reply-new');
+  await record('question', 'question-new');
+  await notifications.record(session, 'reply', 'An older unread reply', 'reply-old', new Date(Date.now() - 40 * 86400_000).toISOString());
+  await store.db.run('INSERT INTO users (id,kind,display_name,created_at) VALUES (?,?,?,?)', 'other-owner', 'test', 'Other owner', stamp());
+  await notifications.markRead('other-owner', session.id);
+  const feed = await notifications.activity('owner');
+  expect(feed.badge).toBe(0);
+  expect(feed.unreadBySession).toEqual({ [session.id]: 2 });
+  await notifications.markRead('owner', session.id);
+  expect((await notifications.activity('owner')).unreadBySession).toEqual({});
+});
+
+it('removes only an owned disconnected device while preserving conversations and other devices', async () => {
+  await record();
+  await expect(notifications.removeDevice('owner', 'mac')).rejects.toMatchObject({ status: 409 });
+  await notifications.updateDevice('owner', 'phone', { revoked: true });
+  await expect(notifications.removeDevice('other-owner', 'phone')).rejects.toMatchObject({ status: 404 });
+  await notifications.removeDevice('owner', 'phone');
+  expect(await store.db.get('SELECT id FROM ws_devices WHERE id=?', 'phone')).toBeUndefined();
+  expect(await store.db.all('SELECT * FROM ws_push_outbox WHERE device_id=?', 'phone')).toEqual([]);
+  expect(await store.db.get('SELECT id FROM ws_devices WHERE id=?', 'mac')).toEqual({ id: 'mac' });
+  expect((await notifications.activity('owner')).items).toHaveLength(1);
+  expect((await store.getSession(session.id)).id).toBe(session.id);
+  await expect(notifications.removeDevice('owner', 'phone')).rejects.toMatchObject({ status: 404 });
 });

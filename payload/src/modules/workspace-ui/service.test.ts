@@ -148,3 +148,28 @@ it('rejects malformed and oversized combined attachments before sending to the a
   expect(send).not.toHaveBeenCalled();
   await connected.stop();
 });
+
+it('includes a bounded latest chat preview per session without tool or progress output', async () => {
+  const agent = await store.db.get<{id:string}>('SELECT id FROM agent_groups LIMIT 1');
+  for (const id of ['preview-chat','preview-empty']) await store.addSession({id,agentId:agent!.id});
+  const put = (id:string,role:'user'|'assistant'|'tool',kind:string,text:string,timestamp:string) => store.putMessage({id,sessionId:'preview-chat',role,kind,text,timestamp,source:'web',files:[]});
+  await put('first','user','chat','Original question','2026-01-01T00:00:00.000Z');
+  await put('reply','assistant','chat','## Ready\n\n**Plan** [review](https://example.com)', '2026-01-01T00:01:00.000Z');
+  await put('tool','tool','tool-result','Do not use tool output as the preview','2026-01-01T00:02:00.000Z');
+  await put('thinking','assistant','thinking','Private progress text','2026-01-01T00:03:00.000Z');
+  const sessions=(await service.bootstrap()).sessions;
+  expect(sessions.find(s=>s.id==='preview-chat')?.latestMessage).toEqual({role:'assistant',text:'Ready Plan review',sender:null,timestamp:'2026-01-01T00:01:00.000Z'});
+  expect(sessions.find(s=>s.id==='preview-empty')?.latestMessage).toBeNull();
+  await put('long','assistant','chat','😀'.repeat(3000), '2026-01-01T00:04:00.000Z');
+  expect(Array.from((await service.bootstrap()).sessions.find(s=>s.id==='preview-chat')!.latestMessage!.text)).toHaveLength(200);
+});
+
+it('previews attachment-only messages, normalizes web senders and resolves timestamp ties consistently', async () => {
+  const agent=await store.db.get<{id:string}>('SELECT id FROM agent_groups LIMIT 1');
+  await store.addSession({id:'attachment-chat',agentId:agent!.id});
+  const timestamp='2026-01-01T00:00:00.000Z';
+  for (const [id,text,files] of [['a','Earlier message',[]],['z','',[{ id: 'attachment-id', name: 'notes.txt' }]]] as const)
+    await store.putMessage({id,sessionId:'attachment-chat',role:'user',kind:'file',text,timestamp,source:'web',files:[...files],data:{sender:'You · Web'}});
+  await store.putMessage({id:'later-empty',sessionId:'attachment-chat',role:'assistant',kind:'chat',text:' \n\t\r ',timestamp:'2026-01-01T00:01:00.000Z',source:'web',files:[]});
+  expect((await service.bootstrap()).sessions.find(s=>s.id==='attachment-chat')?.latestMessage).toEqual({role:'user',text:'Attachment',sender:'You',timestamp});
+});

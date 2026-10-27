@@ -1,3 +1,7 @@
+export const SPEECH_MODELS = ['large-v3-v20240930_626MB', 'large-v3-v20240930_turbo', 'small', 'base', 'tiny', 'parakeet-tdt-v3', 'sensevoice-small'] as const;
+export interface SpeechSettings { enabled: boolean; executable: string; model: string; language: string }
+export const DEFAULT_SPEECH: SpeechSettings = { enabled: true, executable: '', model: SPEECH_MODELS[0], language: 'auto' };
+
 import type { WorkspaceAppearance } from './appearance.js';
 import { DEFAULT_APPEARANCE } from './appearance.js';
 
@@ -8,6 +12,7 @@ export type UtilityProfile =
   | { provider: 'agent'; agentId?: string };
 
 export interface WorkspaceSettings extends WorkspaceAppearance {
+  speech: SpeechSettings;
   enabled: boolean;
   port: number;
   utility: UtilityProfile;
@@ -17,6 +22,7 @@ export interface WorkspaceSettings extends WorkspaceAppearance {
 }
 
 export const DEFAULT_SETTINGS: WorkspaceSettings = {
+  speech: { ...DEFAULT_SPEECH },
   enabled: false,
   port: 3210,
   ...DEFAULT_APPEARANCE,

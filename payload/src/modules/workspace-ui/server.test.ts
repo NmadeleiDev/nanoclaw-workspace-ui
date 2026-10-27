@@ -404,3 +404,18 @@ it('serves read-only agent identity and memory files only to paired owners', asy
   await store.db.run('DELETE FROM user_roles WHERE user_id=?', 'telegram:owner');
   expect((await fetch(route, { headers })).status).toBe(403);
 });
+
+it('requires owner authentication and CSRF to remove an owned disconnected device', async () => {
+  const t = new Date().toISOString();
+  for (const [id, owner] of [['old-browser', 'telegram:owner'], ['other-browser', 'another-owner']])
+    await store.db.run('INSERT INTO ws_devices (id,owner_id,token_hash,origin,name,created_at,last_seen,revoked_at) VALUES (?,?,?,?,?,?,?,?)', id, owner, id, base, 'Old browser', t, t, t);
+  expect((await fetch(`${base}/api/devices/old-browser`, { method: 'DELETE' })).status).toBe(401);
+  expect((await fetch(`${base}/api/devices/old-browser`, { method: 'DELETE', headers: { Cookie: cookie } })).status).toBe(403);
+  const headers = { Cookie: cookie, 'X-Workspace-Csrf': csrf };
+  expect((await fetch(`${base}/api/devices/other-browser`, { method: 'DELETE', headers })).status).toBe(404);
+  expect((await fetch(`${base}/api/devices/old-browser`, { method: 'DELETE', headers })).status).toBe(200);
+  expect(await store.db.get('SELECT id FROM ws_devices WHERE id=?', 'old-browser')).toBeUndefined();
+  expect(await store.db.get('SELECT id FROM ws_devices WHERE id=?', 'other-browser')).toEqual({ id: 'other-browser' });
+  const active = await store.db.get<{id:string}>('SELECT id FROM ws_devices WHERE owner_id=? AND revoked_at IS NULL', 'telegram:owner');
+  expect((await fetch(`${base}/api/devices/${active!.id}`, { method: 'DELETE', headers })).status).toBe(409);
+});

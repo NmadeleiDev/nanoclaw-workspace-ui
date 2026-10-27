@@ -13,3 +13,11 @@ Pairing is owner-only, origin-bound, single-use and rate-limited. Device credent
 OpenClaw import is explicit, local and read-only at source. Agent mapping uses unique IDs/names; ambiguous sources require an operator choice. No owner-specific agent name or project path is built into mapping. Imported histories are metadata and messages, never permission to run old instructions.
 
 Development previews contain copied private state and are never release artifacts. Release generation reads only the allowlist and validates SHA-256 integrity; it does not collect files from a running installation.
+
+## Speech input
+
+Use the microphone beside Send to dictate a message. Stop to transcribe, review the resulting text, then send it normally. It never sends a message automatically. Cancel discards the recording. Failed transcription keeps the recording in browser memory for Retry until cancelled or the conversation is closed.
+
+Settings → Speech controls enablement, model, language and an optional absolute MyWhispr CLI path. The host discovers `mywhispr` in its user-local bin directory or PATH. This integration requires the existing MyWhispr CLI and a compatible Mac host; it does not bundle or install a transcription engine. Choose a model already installed in MyWhispr. The CLI may download missing models on first use.
+
+Desktop localhost and Tailscale HTTPS both support microphone capture. An iPhone records locally and sends audio through the paired workspace connection to the Mac for transcription. Browser microphone permission is required. Chrome/Safari audio is decoded and converted to mono 16 kHz PCM WAV in the browser. The host accepts recordings up to two minutes, serializes inference, bounds its runtime, and removes temporary audio on success, failure or cancellation. Raw recordings are not chat attachments or conversation history. Transcription is local; sending its text uses the agent’s normal provider.

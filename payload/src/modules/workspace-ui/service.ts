@@ -16,7 +16,7 @@ import type { WorkspaceMailboxMessage, WorkspaceMailboxEvent } from '../../mailb
 import { workspaceContext } from './context.js';
 import { requireDirectories } from './directories.js';
 import { WorkspaceStore } from './store.js';
-import { WorkspaceNotifications } from './notifications.js';
+import { WorkspaceNotifications, plainPreview } from './notifications.js';
 import { UtilityModels } from './utility.js';
 import type { WorkspaceBridge } from './bridge.js';
 import { WorkspaceError, requiredText, type WorkspaceSession, type UtilityTask } from './types.js';
@@ -119,6 +119,24 @@ export class WorkspaceService {
       return {...agent,modelProviders:Object.fromEntries(connections.map(c=>[c.id,c.name])),modelProvider:connection?{id:connection.id,label:connection.name}:agent.provider==='opencode'&&byteplus?{id:(process.env.OPENCODE_PROVIDER??env.OPENCODE_PROVIDER)||'anthropic',label:'BytePlus'}:null};
     });
     const runtime = await this.store.db.all('SELECT id,container_status,last_active,status FROM sessions');
+    const previews = await this.store.db.all<{ session_id: string; role: 'user' | 'assistant' | null; text: string | null; source: string | null; data: string; files: string | null; timestamp: string | null }>(
+      `SELECT s.id AS session_id,m.role,substr(m.text,1,2000) AS text,m.source,
+       CASE WHEN m.role='user' THEN m.data ELSE '{}' END AS data,m.files,m.timestamp
+       FROM ws_sessions s LEFT JOIN ws_messages m ON m.id=(
+         SELECT id FROM ws_messages WHERE session_id=s.id AND role IN ('user','assistant')
+         AND kind IN ('chat','chat-sdk','file') AND (trim(replace(replace(replace(text,?,''),?,''),?,''))<>'' OR files<>'[]')
+         ORDER BY timestamp DESC,id DESC LIMIT 1
+       )`, '\t', '\r', '\n',
+    );
+    const latestMessages = new Map(previews.map(row => {
+      const sender = safeJson(row.data).sender;
+      return [row.session_id, row.role ? {
+        role: row.role,
+        text: plainPreview(row.text ?? '') || (row.files && row.files !== '[]' ? 'Attachment' : 'Message'),
+        sender: row.role === 'user' ? (row.source === 'web' ? 'You' : typeof sender === 'string' ? plainPreview(sender) : 'You') : null,
+        timestamp: row.timestamp,
+      } : null] as const;
+    }));
     return {
       timezone: TIMEZONE,
       homeDirectory: os.homedir(),
@@ -126,7 +144,7 @@ export class WorkspaceService {
       agents,
       modelConnections: connections,
       projects: await this.store.projects(),
-      sessions: await this.store.sessions(),
+      sessions: (await this.store.sessions()).map(session => ({ ...session, latestMessage: latestMessages.get(session.id) ?? null })),
       settings: await this.store.settings(),
       runtime,
       connected: !!this.bridge,
@@ -257,7 +275,7 @@ export class WorkspaceService {
       const content = JSON.stringify({
         _workspaceRequestDigest: requestDigest,
         text: input.text,
-        sender: 'You · Web',
+        sender: 'You',
         senderId: ownerId,
         source: 'web',
         attachments,
