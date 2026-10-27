@@ -1,3 +1,4 @@
+import { activitySources, isToolOnly, liveActivityKey, type ActivityMessage } from './activity.js';
 import { resolveProviderName } from '../../providers/provider-name.js';
 import { attachmentLimitError } from './attachment-limits.js';
 import { AgentFiles } from './agent-files.js';
@@ -59,6 +60,8 @@ export class WorkspaceService {
   }
 
   async start(): Promise<void> {
+    const placeholders = await this.store.db.all<{id:string}>("SELECT id FROM ws_sessions WHERE title='New conversation' AND custom_title=0 AND origin<>'openclaw'");
+    for (const session of placeholders) await this.store.seedMessageTitle(session.id);
     await this.notifications.start();
     await this.store.db.run("UPDATE ws_utility_jobs SET state='pending' WHERE state='running'");
     await this.tick();
@@ -313,7 +316,13 @@ export class WorkspaceService {
 
   async live(id: string) {
     const row = await this.store.db.get<{ value: string }>('SELECT value FROM ws_live WHERE session_id=?', id);
-    return row ? JSON.parse(row.value) : null;
+    if (!row) return null;
+    const live = JSON.parse(row.value);
+    if (!live.running && live.startedAt) {
+      const archived = await this.store.db.get('SELECT id FROM ws_messages WHERE session_id=? AND id=?',id,`${id}:${liveActivityKey(live)}`);
+      if (archived) live.archived = true;
+    }
+    return live;
   }
 
   async tick(): Promise<void> {
@@ -370,10 +379,11 @@ export class WorkspaceService {
           session.id,
         )
       )?.cursor ?? 0;
+    const activityCursor = await this.store.db.get<{cursor:number;value:string}>('SELECT cursor,value FROM ws_activity_cursors WHERE session_id=?',session.id);
     const batch = await withExistingMailboxSession(session.agentId, session.nativeSessionId, (box) => ({
       incoming: box.getWorkspaceInbound?.(cursor.in ?? -1, 200) ?? [],
       outgoing: box.getWorkspaceOutbound?.(cursor.out ?? -1, 200) ?? [],
-      events: box.getWorkspaceEvents?.(Math.min(cursor.event ?? 0, notificationCursor), 500) ?? [],
+      events: box.getWorkspaceEvents?.(Math.min(cursor.event ?? 0, notificationCursor, activityCursor?.cursor ?? 0), 500) ?? [],
     }));
     if (!batch) return;
     let changed = false;
@@ -416,7 +426,12 @@ export class WorkspaceService {
       }
       if (rows.length) await this.setCursor(session.id, direction, rows[rows.length - 1].seq);
     }
-    if (batch.events.length) {
+    const activityEvents = batch.events.filter(event=>event.seq > (activityCursor?.cursor ?? 0));
+    if (activityEvents.length) {
+      await this.archiveActivity(session.id, activityEvents, activityCursor?.value);
+      changed = true;
+    }
+    if (batch.events.some(event=>event.seq > (cursor.event ?? 0))) {
       await this.applyEvents(
         session.id,
         batch.events.filter((e) => e.seq > (cursor.event ?? 0)),
@@ -464,6 +479,8 @@ export class WorkspaceService {
         event.seq,
       );
     }
+    if (batch.events.some(event => ['turn-finished','turn-result','turn-cancelled','turn-error'].includes(event.kind)))
+      await this.activitySummaries(session.id);
     if (changed) this.changed();
   }
 
@@ -573,28 +590,102 @@ export class WorkspaceService {
     }
   }
 
+  private reduceActivity(live: any, row: WorkspaceMailboxEvent) {
+    const data = safeJson(row.content);
+    if (row.kind === 'turn-start') live = { running: true, startedAt: row.timestamp, tools: {}, texts: {} };
+    else if (row.kind === 'text-delta') live.texts[data.id] = `${live.texts[data.id] ?? ''}${data.delta ?? ''}`.slice(-100_000);
+    else if (row.kind === 'tool') live.tools[data.id] = { ...live.tools[data.id], ...data };
+    else if (row.kind === 'turn-error') { live.error = data.message; live.running = false; }
+    else if (row.kind === 'turn-result' || row.kind === 'turn-cancelled') { live.running = false; live.texts = {}; }
+    live.updatedAt = row.timestamp;
+    return live;
+  }
+
+  private async archiveActivity(id: string, rows: WorkspaceMailboxEvent[], previous?: string) {
+    let state = previous ? JSON.parse(previous) : { running: false, tools: {}, texts: {} };
+    for (const row of rows) {
+      state = this.reduceActivity(state,row);
+      if (state.startedAt && !state.running && Object.keys(state.tools ?? {}).length) {
+        const key = liveActivityKey(state);
+        // A stable message ID makes replay and repeated terminal events idempotent.
+        // Keep this display record out of session recency/title and agent mailbox writes.
+        await this.store.db.run(`INSERT INTO ws_messages (id,session_id,role,kind,text,timestamp,source,files,data)
+          VALUES (?,?,'tool','activity','',?,'agent','[]',?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
+          `${id}:${key}`,id,row.timestamp,JSON.stringify({activityKey:key,startedAt:state.startedAt,endedAt:row.timestamp,
+            tools:Object.values(state.tools),turnError:state.error}));
+      }
+    }
+    await this.store.db.run(`INSERT INTO ws_activity_cursors (session_id,cursor,value) VALUES (?,?,?)
+      ON CONFLICT(session_id) DO UPDATE SET cursor=excluded.cursor,value=excluded.value`,id,rows.at(-1)!.seq,JSON.stringify(state));
+  }
+
   private async applyEvents(id: string, rows: WorkspaceMailboxEvent[]) {
     let live = (await this.live(id)) ?? { running: false, tools: {}, texts: {} };
-    for (const row of rows) {
-      const data = safeJson(row.content);
-      if (row.kind === 'turn-start') live = { running: true, startedAt: row.timestamp, tools: {}, texts: {} };
-      else if (row.kind === 'text-delta')
-        live.texts[data.id] = `${live.texts[data.id] ?? ''}${data.delta ?? ''}`.slice(-100_000);
-      else if (row.kind === 'tool') live.tools[data.id] = { ...live.tools[data.id], ...data };
-      else if (row.kind === 'turn-error') {
-        live.error = data.message;
-        live.running = false;
-      } else if (row.kind === 'turn-result' || row.kind === 'turn-cancelled') {
-        live.running = false;
-        live.texts = {};
-      }
-      live.updatedAt = row.timestamp;
-    }
+    for (const row of rows) live = this.reduceActivity(live,row);
     await this.store.db.run(
       'INSERT INTO ws_live (session_id,value) VALUES (?,?) ON CONFLICT(session_id) DO UPDATE SET value=excluded.value',
-      id,
-      JSON.stringify(live),
+      id, JSON.stringify(live),
     );
+  }
+
+  async activitySummaries(sessionId: string, messages?: ActivityMessage[], live?: any) {
+    const session = await this.store.getSession(sessionId);
+    const history = messages ?? (await this.store.history(sessionId, undefined, 300)).messages;
+    const state = live === undefined ? await this.live(sessionId) : live;
+    const sources = activitySources(history, state);
+    const settings = await this.store.settings();
+    // Backfill only the latest visible block. Older blocks are summarized on demand.
+    if (settings.automaticSummaries && sources.length && !state?.running)
+      await this.queueActivitySummary(sessionId, sources.at(-1)!, false);
+    const rows = await this.store.db.all<any>(
+      `SELECT a.group_key,a.summary,a.source_key,a.evidence,j.state,j.error FROM ws_activity_summaries a
+       LEFT JOIN ws_utility_jobs j ON j.scope_id=a.id AND j.task='activity-summary' WHERE a.session_id=?`, session.id);
+    return Object.fromEntries(rows.filter(row => !row.group_key.startsWith('live:') || sources.some(source => source.key === row.group_key && digest(source.evidence) === row.source_key))
+      .map(row => [row.group_key, { text: row.summary, count: row.evidence.split('\n').length, state: row.state, error: row.state === 'failed' ? 'Activity summary unavailable. Check the utility model or retry.' : null }]));
+  }
+
+  private async queueActivitySummary(sessionId: string, source: {key: string; evidence: string}, retry: boolean) {
+    const id = digest(`${sessionId}:${source.key}`);
+    const sourceKey = digest(source.evidence);
+    const known = await this.store.db.get<any>("SELECT a.source_key,j.state FROM ws_activity_summaries a LEFT JOIN ws_utility_jobs j ON j.scope_id=a.id AND j.task='activity-summary' WHERE a.id=?",id);
+    if (known?.source_key === sourceKey && known.state && (!retry || known.state !== 'failed')) return;
+    await this.store.db.run(`INSERT INTO ws_activity_summaries (id,session_id,group_key,source_key,evidence,summary,updated_at)
+      VALUES (?,?,?,?,?,'',?) ON CONFLICT(id) DO UPDATE SET source_key=excluded.source_key,evidence=excluded.evidence,summary='',updated_at=excluded.updated_at
+      WHERE ws_activity_summaries.source_key<>excluded.source_key`, id,sessionId,source.key,sourceKey,source.evidence,stamp());
+    if (retry) await this.store.db.run("UPDATE ws_utility_jobs SET state='pending',attempts=0,error=NULL,due_at=? WHERE id=? AND state='failed'",stamp(),`activity-summary:${id}`);
+    await this.enqueue(id, 'activity-summary', sourceKey, retry ? 0 : 1000);
+  }
+
+  async summarizeActivity(sessionId: string, key: string, messageIds?: unknown) {
+    await this.store.getSession(sessionId);
+    let messages: ActivityMessage[] = [];
+    if (key.startsWith('live:')) {
+      const row = await this.store.db.get<any>('SELECT * FROM ws_messages WHERE session_id=? AND id=?',sessionId,`${sessionId}:${key}`);
+      if (row) messages = [{...row,files:JSON.parse(row.files),data:safeJson(row.data)}];
+    } else {
+      if (!Array.isArray(messageIds) || !messageIds.length || messageIds.length > 500 ||
+          messageIds.some(id => typeof id !== 'string' || id.length > 1000) || new Set(messageIds).size !== messageIds.length)
+        throw new WorkspaceError(400, 'Choose an activity block with at most 500 messages.');
+      const rows = await this.store.db.all<any>(`SELECT * FROM ws_messages WHERE session_id=? AND id IN (${messageIds.map(()=>'?').join(',')}) ORDER BY timestamp,id`,sessionId,...messageIds);
+      messages = rows.map(row => ({...row, files: JSON.parse(row.files), data: safeJson(row.data)}));
+      if (messages.length !== messageIds.length || !messages.every(isToolOnly))
+        throw new WorkspaceError(400, 'The selected messages are not this conversation’s tool activity.');
+    }
+    const source = activitySources(messages, await this.live(sessionId)).find(s => s.key === key);
+    if (!source) throw new WorkspaceError(409, 'This activity block changed or is no longer available. Refresh the conversation.');
+    await this.queueActivitySummary(sessionId, source, true);
+    return {ok: true};
+  }
+
+  private async workActivitySummary(job: any) {
+    const row = await this.store.db.get<any>('SELECT * FROM ws_activity_summaries WHERE id=?',job.scope_id);
+    if (!row || row.source_key !== job.source_key) return;
+    const session = await this.store.getSession(row.session_id);
+    const settings = await this.store.settings();
+    const result = await this.models.run(settings.overrides['activity-summary'] ?? settings.utility, {
+      task: 'activity-summary', text: row.evidence, current: '', agentId: session.agentId, signal: this.controller.signal,
+    });
+    await this.store.db.run('UPDATE ws_activity_summaries SET summary=?,updated_at=? WHERE id=? AND source_key=?',result,stamp(),row.id,job.source_key);
   }
 
   async enqueue(scopeId: string, task: UtilityTask, sourceKey: string = randomUUID(), delayMs = 0): Promise<void> {
@@ -633,6 +724,12 @@ export class WorkspaceService {
       if (!claimed.changes) return;
       this.changed();
       try {
+        if (job.task === 'activity-summary') {
+          await this.workActivitySummary(job);
+          await this.store.db.run("UPDATE ws_utility_jobs SET state='completed',error=NULL,updated_at=? WHERE id=? AND source_key=?",stamp(),job.id,job.source_key);
+          this.changed();
+          return;
+        }
         const settings = await this.store.settings();
         const task = job.task as UtilityTask;
         const scope = task === 'project-summary' ? 'project' : 'session';

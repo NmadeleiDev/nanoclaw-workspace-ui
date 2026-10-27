@@ -4,6 +4,7 @@ import { runMigrations } from '../../db/migrations/index.js';
 import './migration.js';
 import { WorkspaceStore } from './store.js';
 import { WorkspaceService } from './service.js';
+import { messageGroups } from './activity.js';
 import type { WorkspaceMailboxMessage, WorkspaceMailboxEvent } from '../../mailbox/types.js';
 const fake = vi.hoisted(() => ({
   out: [] as WorkspaceMailboxMessage[],
@@ -103,4 +104,52 @@ it('records a failure without raw diagnostics or requiring a chat message', asyn
     kind: 'failure',
     text: expect.stringContaining('could not finish'),
   });
+});
+
+it('retains completed native turns across new turns and pins them after their assistant replies', async () => {
+  const time=(n:number)=>`2026-10-28T01:00:${String(n).padStart(2,'0')}.000Z`;
+  const event=(seq:number,kind:string,data:any={})=>({seq,kind,timestamp:time(seq),content:JSON.stringify(data)});
+  fake.events=[event(1,'turn-start'),event(2,'tool',{id:'t1',name:'Bash',status:'completed',input:'test',output:'passed'}),event(4,'turn-result')];
+  fake.out=[{...message('a1',1,'First answer'),timestamp:time(3)}];
+  const session=await store.getSession('s');
+  await service.collect(session);
+  expect(await service.live('s')).toMatchObject({running:false,archived:true});
+  await store.putMessage({id:'u2',sessionId:'s',role:'user',kind:'chat',text:'Next question',timestamp:time(5),source:'web',files:[]});
+  let history=(await store.history('s')).messages;
+  expect(messageGroups(history).flat().map(m=>m.data?.activityKey?'activity':m.id)).toEqual(['s:out:a1','activity','u2']);
+  fake.events.push(event(6,'turn-start'),event(7,'tool',{id:'t2',name:'Read',status:'completed',output:'brief'}),event(9,'turn-result'));
+  fake.out.push({...message('a2',3,'Second answer'),timestamp:time(8)});
+  await service.collect(session);await service.collect(session);
+  history=(await store.history('s')).messages;
+  expect(messageGroups(history).flat().map(m=>m.data?.activityKey?'activity':m.id)).toEqual(['s:out:a1','activity','u2','s:out:a2','activity']);
+  const blocks=history.filter(m=>m.data?.activityKey);
+  expect(blocks).toHaveLength(2);expect((blocks[0].data?.tools as any[])[0].output).toBe('passed');
+  await service.summarizeActivity('s',String(blocks[0].data!.activityKey));
+  expect((await store.db.all<any>("SELECT evidence FROM ws_activity_summaries WHERE group_key=?",blocks[0].data!.activityKey))[0].evidence).toContain('passed');
+});
+it('backfills retained events independently of existing live and notification cursors',async()=>{
+  const time=(n:number)=>`2026-10-28T02:00:${String(n).padStart(2,'0')}.000Z`;
+  fake.events=[{seq:1,kind:'turn-start',timestamp:time(1),content:'{}'},
+    {seq:2,kind:'tool',timestamp:time(2),content:JSON.stringify({id:'t',name:'Bash',status:'completed'})},
+    {seq:3,kind:'turn-result',timestamp:time(3),content:'{}'}];
+  await store.db.run("INSERT INTO ws_cursors VALUES ('s','event',99)");
+  await store.db.run("INSERT INTO ws_notification_cursors VALUES ('s',99)");
+  await store.db.run('INSERT INTO ws_live VALUES (?,?)','s',JSON.stringify({running:true,startedAt:time(10),tools:{},texts:{}}));
+  await service.collect(await store.getSession('s'));
+  expect((await store.history('s')).messages.filter(m=>m.data?.activityKey)).toHaveLength(1);
+  expect(await service.live('s')).toMatchObject({running:true,startedAt:time(10)});
+});
+
+it('restores an activity turn split across batches and retains cancellation details',async()=>{
+  fake.events=[{seq:1,kind:'turn-start',timestamp:'2026-10-28T03:00:01.000Z',content:'{}'},
+    {seq:2,kind:'tool',timestamp:'2026-10-28T03:00:02.000Z',content:JSON.stringify({id:'t',name:'Bash',status:'failed',error:'Cancelled command'})}];
+  const session=await store.getSession('s');await service.collect(session);
+  expect((await store.history('s')).messages).toHaveLength(0);
+  // A fresh service reads the durable replay state, independently of in-memory state.
+  await service.stop();service=new WorkspaceService(store);
+  fake.events.push({seq:3,kind:'turn-cancelled',timestamp:'2026-10-28T03:00:03.000Z',content:'{}'});
+  await service.collect(session);
+  const block=(await store.history('s')).messages[0];
+  expect((block.data?.tools as any[])[0]).toMatchObject({status:'failed',error:'Cancelled command'});
+  expect(await service.live('s')).toMatchObject({running:false,archived:true});
 });

@@ -1,4 +1,4 @@
-import { DEFAULT_SPEECH, SpeechTranscriber, speechAudio, speechStatus } from './speech.js';
+import { DEFAULT_SPEECH, SpeechTranscriber, speechAudio, speechStatus, parseSpeech } from './speech.js';
 import { getProviderHostContract } from '../../provider-contracts/registry.js';
 import { agentModelSettings, updateAgentModelSettings } from '../../agent-model-settings.js';
 import { listModelConnections, removeModelConnection, saveModelConnection, seedEnvironmentConnection, parseConnection, ModelSettingsError } from '../../model-connections.js';
@@ -123,7 +123,8 @@ export async function startWorkspaceServer(
       }
       const principal = await auth.authorize(req, !['GET', 'HEAD'].includes(method), res);
       if (!(await isOwner(principal.ownerId))) throw new WorkspaceError(403, 'Owner access has been revoked.');
-      if (route === '/api/speech' && method === 'GET') return json(speechStatus((await service.store.settings()).speech ?? DEFAULT_SPEECH));
+      if (route === '/api/speech' && method === 'GET') return json(await speechStatus((await service.store.settings()).speech ?? DEFAULT_SPEECH));
+      if (route === '/api/speech/check' && method === 'POST') return json(await speechStatus(parseSpeech(await body(req))));
       if (route === '/api/speech/transcribe' && method === 'POST') {
         if (!service.bridge) throw new WorkspaceError(403, 'Speech input is unavailable in preview.');
         const controller = new AbortController();
@@ -314,14 +315,21 @@ export async function startWorkspaceServer(
         const limit = Number(url.searchParams.get('limit') ?? 100);
         if (!Number.isFinite(limit)) throw new WorkspaceError(400, 'Invalid page size.');
         const history = await service.store.history(session.id, url.searchParams.get('before') ?? undefined, limit);
+        const live = await service.live(session.id);
         return json({
           session,
           ...history,
-          live: await service.live(session.id),
+          live,
+          activitySummaries: await service.activitySummaries(session.id, history.messages, live),
           pending: session.nativeSessionId ? await service.pending(session.nativeSessionId) : [],
         });
       }
       if (match && method === 'PATCH') return json(await service.updateSession(match[1], await body(req)));
+      match = /^\/api\/sessions\/([^/]+)\/activity-summary$/.exec(route);
+      if (match && method === 'POST') {
+        const input = await body(req);
+        return json(await service.summarizeActivity(match[1], requiredText(input.key, 'Activity block', 1000), input.messageIds));
+      }
       match = /^\/api\/sessions\/([^/]+)\/files$/.exec(route);
       if (match && method === 'GET') {
         await service.store.getSession(match[1]);

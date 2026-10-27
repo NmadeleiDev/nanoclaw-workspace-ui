@@ -419,3 +419,20 @@ it('requires owner authentication and CSRF to remove an owned disconnected devic
   const active = await store.db.get<{id:string}>('SELECT id FROM ws_devices WHERE owner_id=? AND revoked_at IS NULL', 'telegram:owner');
   expect((await fetch(`${base}/api/devices/${active!.id}`, { method: 'DELETE', headers })).status).toBe(409);
 });
+
+it('returns cached tool-activity summaries through the session API', async () => {
+  await store.db.run('INSERT INTO agent_groups (id,name,folder,created_at) VALUES (?,?,?,?)','summary-agent','Assistant','summary-agent',new Date().toISOString());
+  await store.addSession({id:'summary-chat',agentId:'summary-agent'});
+  const live={running:false,startedAt:'2026-10-28T00:00:00.000Z',tools:{one:{name:'Bash',status:'completed',input:'pnpm test',output:'8 tests passed'}},texts:{}};
+  await store.db.run('INSERT INTO ws_live VALUES (?,?)','summary-chat',JSON.stringify(live));
+  const generate=vi.spyOn(service.models,'run').mockResolvedValue('Ran the test suite; all eight tests passed.');
+  const get=async()=>{
+    const result=await fetch(`${base}/api/sessions/summary-chat`,{headers:{Cookie:cookie}});
+    expect(result.status).toBe(200);return result.json() as Promise<any>;
+  };
+  expect((await get()).activitySummaries['live:2026-10-28T00:00:00.000Z'].state).toBe('pending');
+  await store.db.run("UPDATE ws_utility_jobs SET due_at=? WHERE task='activity-summary'",'2000-01-01T00:00:00.000Z');
+  await service.work();
+  expect((await get()).activitySummaries['live:2026-10-28T00:00:00.000Z'].text).toBe('Ran the test suite; all eight tests passed.');
+  expect(generate).toHaveBeenCalledOnce();generate.mockRestore();
+});

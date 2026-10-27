@@ -3,6 +3,7 @@ import { initTestDb, closeDb } from '../../db/connection.js';
 import './migration.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { WorkspaceStore } from './store.js';
+import { WorkspaceService } from './service.js';
 import { THEME_PRESETS } from './appearance.js';
 
 let store: WorkspaceStore;
@@ -124,4 +125,42 @@ it('persists an accessible text scale without changing chat or utility model con
   expect((await store.settings()).textScale).toBe(140);
   await expect(store.saveSettings({ textScale: 99 })).rejects.toMatchObject({ status: 400 });
   await expect(store.saveSettings({ textScale: 201 })).rejects.toMatchObject({ status: 400 });
+});
+
+it('names a new session from its first message until the utility model replaces the title',async()=>{
+ await store.addSession({id:'first-message-title',agentId:'assistant'});
+ const message={id:'first-message',sessionId:'first-message-title',role:'user' as const,kind:'chat',text:'  помоги составить\n  план следующего релиза  ',timestamp:'2026-10-28T00:00:00.000Z',source:'web',files:[]};
+ await store.putMessage(message);
+ expect(await store.getSession(message.sessionId)).toMatchObject({title:'помоги составить план следующего релиза',customTitle:false});
+ await store.putMessage({...message,id:'second-message',text:'A follow-up message',timestamp:'2026-10-28T00:00:01.000Z'});
+ expect((await store.getSession(message.sessionId)).title).toBe('помоги составить план следующего релиза');
+ await store.updateSession(message.sessionId,{title:'Generated issue overview'},true);
+ expect((await store.getSession(message.sessionId)).title).toBe('Generated issue overview');
+});
+it('bounds provisional titles without splitting Unicode surrogate pairs',async()=>{
+ await store.addSession({id:'long-title',agentId:'assistant'});
+ await store.putMessage({id:'long-first',sessionId:'long-title',role:'user',kind:'chat',text:'😀'.repeat(100),timestamp:new Date().toISOString(),source:'web',files:[]});
+ expect((await store.getSession('long-title')).title).toBe('😀'.repeat(79)+'…');
+});
+it('keeps custom and imported titles, and uses a filename for an attachment-only first message',async()=>{
+ for(const id of ['manual-title','imported-title','file-title'])await store.addSession({id,agentId:'assistant',...(id==='imported-title'?{origin:'openclaw' as const}:{})});
+ await store.updateSession('manual-title',{title:'My chosen name'});
+ for(const id of ['manual-title','imported-title','file-title'])await store.putMessage({id:`first-${id}`,sessionId:id,role:'user',kind:'file',text:'',timestamp:new Date().toISOString(),source:'web',files:[{id:'attachment',name:'architecture.pdf'}]});
+ expect((await store.getSession('manual-title')).title).toBe('My chosen name');
+ expect((await store.getSession('imported-title')).title).toBe('New conversation');
+ expect((await store.getSession('file-title')).title).toBe('architecture.pdf');
+ await store.updateSession('file-title',{title:'Pinned human title'});
+ await store.updateSession('file-title',{title:'Late model title'},true);
+ expect((await store.getSession('file-title')).title).toBe('Pinned human title');
+});
+it('can backfill existing placeholders without changing descriptive generated titles',async()=>{
+ await store.addSession({id:'backfill-title',agentId:'assistant'});
+ await store.putMessage({id:'backfill-first',sessionId:'backfill-title',role:'user',kind:'chat',text:'Existing first message',timestamp:new Date().toISOString(),source:'web',files:[]});
+ await store.db.run("UPDATE ws_sessions SET title='New conversation' WHERE id=?",'backfill-title');
+ const service = new WorkspaceService(store);
+ try { await service.start(); } finally { await service.stop(); }
+ expect((await store.getSession('backfill-title')).title).toBe('Existing first message');
+ await store.updateSession('backfill-title',{title:'Useful generated title'},true);
+ await store.seedMessageTitle('backfill-title');
+ expect((await store.getSession('backfill-title')).title).toBe('Useful generated title');
 });

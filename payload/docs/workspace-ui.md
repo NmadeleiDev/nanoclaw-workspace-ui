@@ -16,11 +16,22 @@ Development previews contain copied private state and are never release artifact
 
 ## Speech input
 
-Use the microphone beside Send to dictate a message. Stop to transcribe, review the resulting text, then send it normally. It never sends a message automatically. Cancel discards the recording. Failed transcription keeps the recording in browser memory for Retry until cancelled or the conversation is closed.
+Use the microphone beside Send to dictate, review the transcript, then send normally. Cancel discards the recording; a failed transcription can be retried while the conversation stays open. Speech is optional and starts disabled in new installations.
 
-Settings → Speech controls enablement, model, language and an optional absolute MyWhispr CLI path. The host discovers `mywhispr` in its user-local bin directory or PATH. This integration requires the existing MyWhispr CLI and a compatible Mac host; it does not bundle or install a transcription engine. Choose a model already installed in MyWhispr. The CLI may download missing models on first use.
+Settings → Speech offers two independent backends:
 
-Desktop localhost and Tailscale HTTPS both support microphone capture. An iPhone records locally and sends audio through the paired workspace connection to the Mac for transcription. Browser microphone permission is required. Chrome/Safari audio is decoded and converted to mono 16 kHz PCM WAV in the browser. The host accepts recordings up to two minutes, serializes inference, bounds its runtime, and removes temporary audio on success, failure or cancellation. Raw recordings are not chat attachments or conversation history. Transcription is local; sending its text uses the agent’s normal provider.
+- **whisper.cpp local server:** works without MyWhispr. Run the standalone server on the workspace host, select this backend, enter its loopback HTTP address, and choose Check backend. Its model is selected when starting the server.
+- **MyWhispr macOS CLI:** keeps the existing CLI integration. Choose an installed model and optionally provide an absolute CLI path. Existing installations retain this backend, including their saved model, language and path; old installations using implicit defaults also retain MyWhispr.
+
+For the standalone backend, follow the [official whisper.cpp server instructions](https://github.com/ggml-org/whisper.cpp/tree/v1.9.5/examples/server). The integration contract is verified against the v1.9.5 documentation. Build a current supported release and obtain a trusted multilingual model, then start it bound to loopback, for example:
+
+```sh
+./build/bin/whisper-server --host 127.0.0.1 --port 8080 -m /path/to/ggml-base.bin --language auto
+```
+
+Enter `http://127.0.0.1:8080` in Settings → Speech, check readiness, enable speech input, and save. No API key is needed. The add-on calls `/health` and sends multipart WAV uploads to `/inference`; it does not install a server or download models. Keep the transcription server private on loopback. Redirects and non-loopback endpoints are rejected. Backend checks do not save settings or upload audio.
+
+Desktop localhost and Tailscale HTTPS support microphone capture. An iPhone records on-device and sends audio through the paired workspace connection to the host. Browser microphone permission is required. The browser converts recordings to mono 16 kHz PCM WAV. Recordings are limited to two minutes, inference is serialized and time-bounded, and temporary CLI audio is removed on success, failure or cancellation. The HTTP backend uploads audio from memory. Recordings are not chat attachments or conversation history. Transcription is local; sending its text uses the agent’s normal provider.
 
 ## Connection recovery
 
@@ -29,3 +40,27 @@ If the workspace connection drops, background refresh shows a persistent reconne
 Messages and other changes are never automatically retried. If their response is lost, check the conversation or setting before trying again: the action may already have completed.
 
 Tailscale health-check failures pause remote authorization while preserving the owned Serve process. Access resumes only after the private route is verified. A confirmed route change or Funnel exposure still releases that process immediately. Host logs record failed CLI checks, Serve exits and recovery; browser diagnostics record the failed request method, path and status without query strings, response bodies, credentials or message text.
+
+## Tool activity summaries
+
+Completed “Worked” blocks can show a short utility-generated sentence alongside the step count. Expand the block to inspect the original tool activity. Summaries describe observed actions, results and blockers; they are not a replacement for the tool record.
+
+The latest completed block is summarized in the background when Automatic summaries is enabled. Expand an older block and choose Summarize activity to request one on demand. Each label is cached against its source evidence, limited to 24 words and 180 characters, and kept out of agent context and scratchpads. Failures have bounded retries and an explicit retry control.
+
+Settings → Utility models selects the model, with an optional Tool activity summaries override. Existing utility providers are reused; no extra service or model is installed.
+
+## Provisional conversation titles
+
+After the first message is accepted, a new conversation uses that message as its provisional name: whitespace is collapsed and the title is capped at 80 Unicode characters, including an ellipsis when shortened. Attachment-only messages use the first filename. The utility model may replace this provisional name later; human names and imported history names are preserved. Existing unnamed conversations with a first message are filled in on startup.
+
+## Quoting replies
+
+Select text within an agent reply and choose **Quote** to append it as a Markdown blockquote in your draft, with space beneath for your response. Existing draft text is preserved and nothing is sent automatically. The quote icon beside Copy quotes the selected passage from that reply, or the whole reply when no passage is selected. Keyboard users can select text and press **Alt/Option+Q**. Quotes are scoped to the current conversation; imported reference-only chats cannot accept drafts.
+
+## Tool activity history
+
+Completed native turns retain a separate **Worked** block with their tool inputs, outputs and statuses. Each block is pinned after that turn’s last agent reply, before subsequent user messages; the active turn alone uses the live **Working** block. Independent replay cursors restore earlier completed turns from retained mailbox events without replaying messages, notifications or agent actions. Repeated collection and restarts do not duplicate blocks. Older activity without retained events cannot be reconstructed. Activity summaries remain attached to their original blocks, including when loading earlier messages.
+
+The rename dialog focuses the title field. Press Enter or choose **Save title** to save and close it. Blank titles are rejected, repeated submissions are disabled while saving, and save failures leave the edited title available for retry.
+
+Session scratchpad summaries target 50–90 words in the user’s latest substantive conversational language, with localized Goal, Now, and (when supported) Next or Blocked labels. They preserve human corrections, replace stale status with newer evidence, and omit historical recaps and nonessential metrics. This is a generation instruction, not a hard truncation limit. Existing notes change on the next automatic or manual refresh.

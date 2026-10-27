@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { encodeSpeechWav, speechBase64 } from './speech-audio';
 type Request = <T = any>(url: string, method?: string, data?: unknown, signal?: AbortSignal) => Promise<T>;
-export type SpeechConfig = { enabled: boolean; executable: string; model: string; language: string };
+import { SPEECH_MODELS, type SpeechSettings as SpeechConfiguration } from '../../../src/modules/workspace-ui/types';
+export type SpeechConfig = SpeechConfiguration;
 const microphone = (
   <svg
     width="19"
@@ -26,11 +27,19 @@ export function SpeechSettings({
   request: Request;
 }) {
   const [status, setStatus] = useState<any>(null);
+  const [checking,setChecking] = useState(false);
+  const [checkError,setCheckError] = useState('');
+  const checkController = useRef<AbortController | null>(null);
+  useEffect(() => {
+    setCheckError('');
+    return () => checkController.current?.abort();
+  }, [value.backend, value.endpoint, value.executable]);
+  const sameBackend = status?.backend === value.backend && (value.backend === 'mywhispr' ? status?.settings?.executable === value.executable : status?.settings?.endpoint === value.endpoint);
   useEffect(() => {
     const c = new AbortController();
     void request('/speech', 'GET', undefined, c.signal)
       .then(setStatus)
-      .catch(() => {});
+      .catch(e => {if(!c.signal.aborted)setCheckError(String(e));});
     return () => c.abort();
   }, [request]);
   return (
@@ -38,7 +47,7 @@ export function SpeechSettings({
       <div className="settings-section-heading">
         <div>
           <h3>Speak your next message.</h3>
-          <p>Transcribe on the workspace host with MyWhispr. Review and edit the text before sending.</p>
+          <p>Transcribe locally on the workspace host. Review and edit the text before sending.</p>
         </div>
       </div>
       <label className="speech-enable">
@@ -49,17 +58,42 @@ export function SpeechSettings({
         />{' '}
         Enable speech input
       </label>
+      <label>
+        Transcription backend
+        <select value={value.backend} onChange={e=>change({...value,backend:e.target.value as SpeechConfig['backend']})}>
+          <option value="whisper-server">whisper.cpp · local server</option>
+          <option value="mywhispr">MyWhispr · macOS CLI</option>
+        </select>
+      </label>
+      {value.backend === 'whisper-server' && <>
+        <label>Server address
+          <input type="url" value={value.endpoint} onChange={e=>change({...value,endpoint:e.target.value})} placeholder="http://127.0.0.1:8080" />
+        </label>
+        <p>Run whisper-server on this host with your chosen model. MyWhispr is not required. Only loopback HTTP addresses are accepted; the model is selected when starting the server.</p>
+      </>}
+      <div>
+        <button type="button" className="button secondary small" disabled={checking} onClick={()=>{
+          setChecking(true);setCheckError('');
+          const controller = new AbortController();
+          checkController.current = controller;
+          void request('/speech/check','POST',value,controller.signal)
+            .then(result=>{if(!controller.signal.aborted)setStatus({...result,settings:value});})
+            .catch(e=>{if(!controller.signal.aborted)setCheckError(String(e));})
+            .finally(()=>{if(checkController.current===controller)setChecking(false);});
+        }}>{checking ? 'Checking…' : 'Check backend'}</button>
+      </div>
       <p role="status">
-        {status
+        {checkError || (sameBackend
           ? status.available
-            ? 'MyWhispr CLI is available on this host.'
-            : 'MyWhispr CLI was not found. Install it on the workspace host, or enter its full path below.'
-          : 'Checking local transcription…'}
+            ? value.backend === 'mywhispr' ? 'MyWhispr CLI is available on this host.' : 'Local whisper.cpp server is ready.'
+            : value.backend === 'mywhispr' ? 'MyWhispr CLI was not found. Install it on the workspace host, or enter its full path below.' : 'The local server is not ready. Start whisper-server, then check again.'
+          : 'Check this backend before saving. Checking does not change your saved settings.')}
       </p>
+      {value.backend === 'mywhispr' && <>
       <label>
         Local model
         <select value={value.model} onChange={(e) => change({ ...value, model: e.target.value })}>
-          {(status?.models ?? ['large-v3-v20240930_626MB']).map((id: string) => (
+          {SPEECH_MODELS.map((id: string) => (
             <option key={id} value={id}>
               {(
                 {
@@ -76,6 +110,7 @@ export function SpeechSettings({
           ))}
         </select>
       </label>
+      </>}
       <label>
         Language
         <select value={value.language} onChange={(e) => change({ ...value, language: e.target.value })}>
@@ -98,17 +133,17 @@ export function SpeechSettings({
           ))}
         </select>
       </label>
-      <label>
+      {value.backend === 'mywhispr' && <label>
         MyWhispr CLI path
         <input
           value={value.executable}
           placeholder="Find automatically"
           onChange={(e) => change({ ...value, executable: e.target.value })}
         />
-      </label>
+      </label>}
       <p>
-        Choose a model already downloaded in MyWhispr. A missing model may be downloaded by its CLI on first use.
-        Recordings are limited to two minutes and deleted after transcription. Audio stays on your device and workspace
+        {value.backend === 'mywhispr' && 'Choose a model already downloaded in MyWhispr. Its CLI may download a missing model on first use. '}
+        Recordings are limited to two minutes. {value.backend === 'mywhispr' ? 'Temporary CLI audio is deleted after transcription. ' : 'Audio is uploaded from memory; the local server controls its own storage. '}Audio stays on your device and workspace
         host; sending the resulting message uses your agent’s normal model provider.
       </p>
     </section>

@@ -1,11 +1,11 @@
 export const SPEECH_MODELS = ['large-v3-v20240930_626MB', 'large-v3-v20240930_turbo', 'small', 'base', 'tiny', 'parakeet-tdt-v3', 'sensevoice-small'] as const;
-export interface SpeechSettings { enabled: boolean; executable: string; model: string; language: string }
-export const DEFAULT_SPEECH: SpeechSettings = { enabled: true, executable: '', model: SPEECH_MODELS[0], language: 'auto' };
+export interface SpeechSettings { enabled: boolean; backend: 'mywhispr' | 'whisper-server'; endpoint: string; executable: string; model: string; language: string }
+export const DEFAULT_SPEECH: SpeechSettings = { enabled: false, backend: 'whisper-server', endpoint: 'http://127.0.0.1:8080', executable: '', model: SPEECH_MODELS[0], language: 'auto' };
 
 import type { WorkspaceAppearance } from './appearance.js';
 import { DEFAULT_APPEARANCE } from './appearance.js';
 
-export type UtilityTask = 'title' | 'session-summary' | 'project-summary';
+export type UtilityTask = 'title' | 'session-summary' | 'project-summary' | 'activity-summary';
 export type UtilityProfile =
   | { provider: 'ollama'; model: string; endpoint: string }
   | { provider: 'apple' }

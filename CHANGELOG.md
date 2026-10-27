@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Refresh the README and demo with all four themes, utility model options, mobile access and current chat features.
+- Keep session overviews concise, follow the latest conversational language and replace stale status with newer evidence.
+
+- Focus the title when renaming a conversation and support Enter to save, retaining edits on failure.
+
+- Retain completed tool activity for every native turn and pin it after the corresponding agent reply, with idempotent recovery from retained events.
+
+- Quote selected agent text or entire replies into an existing draft, with keyboard and touch controls.
+
+- Use the first message as a provisional conversation title while awaiting utility-model naming.
+
+- Add a standalone whisper.cpp speech backend with readiness checks, while preserving existing MyWhispr installations and settings.
+
+- Add cached, bounded utility-model summaries to completed tool activity, with per-task model selection and on-demand summaries for older blocks.
+
 - Keep mobile composer controls aligned, with a single-line folder path and 44-pixel touch targets.
 
 - Recover safely from connection interruptions with read-only retries, a persistent status banner and privacy-conscious request diagnostics.

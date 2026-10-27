@@ -1,3 +1,5 @@
+import { appendQuote, QuoteIcon, useMessageQuotes } from './quotes';
+import { isToolOnly, messageGroups, liveActivityKey, activityGroupKey } from '../../../src/modules/workspace-ui/activity';
 import { WorkspaceConnectionError, workspaceRequest } from './response';
 import { SpeechButton, SpeechSettings, type SpeechConfig } from './speech';
 import { resolveNavigation, navigationUrl, navigationKey } from './navigation';
@@ -101,7 +103,7 @@ type Message = {
   source: string;
   kind: string;
   files: { id: string; name: string; mime?: string }[];
-  data?: { tools?: { name: string; input: unknown }[]; toolName?: string; sender?: string };
+  data?: { activityKey?: string; startedAt?: string; endedAt?: string; turnError?: string; tools?: { name: string; input: unknown; status?: string; output?: string; error?: string }[]; toolName?: string; sender?: string };
 };
 type Doc = { markdown: string; revision: number; author: string; updatedAt: string };
 type Profile = { provider: 'ollama' | 'apple' | 'agent'; model?: string; endpoint?: string; agentId?: string };
@@ -129,10 +131,14 @@ type Bootstrap = {
   jobs: { scope_id: string; task: string; state: string; error?: string }[];
 };
 type Detail = {
+  activitySummaries?: Record<string, ActivitySummary>;
   session: Session;
   messages: Message[];
   next: string | null;
   live?: {
+    archived?: boolean;
+    startedAt?: string;
+    updatedAt?: string;
     running: boolean;
     tools: Record<
       string,
@@ -371,9 +377,9 @@ function ago(value: string) {
 function fullTime(value: string) {
   return formatLocalTime(value, displayTimezone);
 }
-function RichText({ text }: { text: string }) {
+function RichText({ text, quoteId }: { text: string; quoteId?: string }) {
   return (
-    <div className="markdown">
+    <div className="markdown" data-quote-source={quoteId}>
       <Markdown
         remarkPlugins={[remarkGfm]}
         components={{
@@ -614,20 +620,22 @@ function ProgressContent({ value, label = 'Output' }: { value: unknown; label?: 
   );
 }
 
-function isToolOnly(message: Message) {
-  return (
-    message.files.length === 0 &&
-    (message.role === 'tool' || (message.role === 'assistant' && !message.text.trim() && !!message.data?.tools?.length))
-  );
+type ActivitySummary = { count: number; text: string; state: string; error: string | null };
+function ActivityLabel({ label, summary }: {label: string; summary?: ActivitySummary}) {
+  return <span className="activity-label"><strong>{label}</strong>
+    {summary?.text ? <small>{summary.text}</small> : ['pending','running'].includes(summary?.state ?? '') ? <small>Summarizing activity…</small> : null}
+  </span>;
 }
-function messageGroups(messages: Message[]): Message[][] {
-  const groups: Message[][] = [];
-  for (const message of messages) {
-    const last = groups[groups.length - 1];
-    if (isToolOnly(message) && last?.every(isToolOnly)) last.push(message);
-    else groups.push([message]);
-  }
-  return groups;
+function ActivitySummaryAction({sessionId, groupKey, messageIds, summary, notify}: {sessionId: string; groupKey: string; messageIds?: string[]; summary?: ActivitySummary; notify: (s: string) => void}) {
+  const [busy,setBusy] = useState(false);
+  if (summary?.text || ['pending','running'].includes(summary?.state ?? '')) return null;
+  return <div className="activity-summary-action">
+    {summary?.error && <span role="status">{summary.error}</span>}
+    <button type="button" className="text-button" disabled={busy} onClick={() => {
+      setBusy(true);
+      void api(`/sessions/${sessionId}/activity-summary`, 'POST', {key: groupKey, messageIds}).catch(e=>notify(String(e))).finally(()=>setBusy(false));
+    }}>{busy ? 'Queuing summary…' : summary?.error ? 'Retry summary' : 'Summarize activity'}</button>
+  </div>;
 }
 
 function SessionFiles({ id, version, notify }: { id: string; version: number; notify: (s: string) => void }) {
@@ -746,7 +754,7 @@ function Dialog({
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement;
-    ref.current?.querySelector<HTMLElement>('input,textarea,button,select')?.focus();
+    (ref.current?.querySelector<HTMLElement>('[data-autofocus]') ?? ref.current?.querySelector<HTMLElement>('input,textarea,button,select'))?.focus();
     const key = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
@@ -1860,14 +1868,14 @@ function WorkspaceSettings({
               />
               <div className="setting-line">
                 <div>
-                  <strong>Automatic scratchpads</strong>
-                  <span>Update working notes after completed turns.</span>
+                  <strong>Automatic summaries</strong>
+                  <span>Update scratchpads and tool activity labels after completed turns.</span>
                 </div>
                 <button
                   title={
                     settings.automaticSummaries
-                      ? 'Turn off automatic note updates after turns'
-                      : 'Update scratchpad notes automatically after turns'
+                      ? 'Turn off automatic scratchpad and activity summaries'
+                      : 'Generate scratchpad and activity summaries automatically'
                   }
                   className={`switch ${settings.automaticSummaries ? 'on' : ''}`}
                   role="switch"
@@ -1898,6 +1906,7 @@ function WorkspaceSettings({
                   ['title', 'Session titles'],
                   ['session-summary', 'Session scratchpads'],
                   ['project-summary', 'Project scratchpads'],
+                  ['activity-summary', 'Tool activity summaries'],
                 ].map(([id, title]) => (
                   <div className="task-override" key={id}>
                     <button
@@ -2202,6 +2211,7 @@ function App() {
   const [sending, setSending] = useState(false);
   const [speechBusy, setSpeechBusy] = useState(false);
   const [rename, setRename] = useState('');
+  const [renameSaving, setRenameSaving] = useState(false);
   const [creatingSession, setCreatingSession] = useState(false);
   const creationPending = useRef(false);
   const [sessionFolders, setSessionFolders] = useState<Directory[]>([]);
@@ -2277,6 +2287,7 @@ function App() {
             old && old.session.id === id && old.messages.length > next.messages.length
               ? {
                   ...next,
+                  activitySummaries: {...old.activitySummaries,...next.activitySummaries},
                   messages: [
                     ...old.messages.filter((m) => !next.messages.some((n) => n.id === m.id)),
                     ...next.messages,
@@ -2427,7 +2438,7 @@ function App() {
           jumping.current = false;
           setDetail((old) =>
             old?.session.id === earlier.session.id
-              ? { ...old, next: earlier.next, messages: [...earlier.messages, ...old.messages] }
+              ? { ...old, next: earlier.next, activitySummaries: {...earlier.activitySummaries,...old.activitySummaries}, messages: [...earlier.messages, ...old.messages] }
               : old,
           );
         })
@@ -2540,6 +2551,19 @@ function App() {
     setDraft(text);
     localStorage.setItem(`ws.draft:${sessionId ?? `new:${agentId}`}`, text);
   };
+  const quoting = useMessageQuotes(sessionId ?? '', !!sessionId && detail?.session.id === sessionId && detail.session.origin !== 'openclaw' && !sending && !modal, text => {
+    const next = appendQuote(draftRef.current, text);
+    if (next.length > 100_000) { notify('That quote would make the message too long. Select a shorter passage.'); return false; }
+    draftRef.current = next;
+    setDraft(next);
+    try { localStorage.setItem(`ws.draft:${sessionId}`, next); }
+    catch { notify('Quote added, but browser draft storage is full. Keep this conversation open until sending.'); }
+    requestAnimationFrame(() => {
+      const input = composer.current;
+      if (input) { input.focus(); input.setSelectionRange(next.length, next.length); input.scrollTop = input.scrollHeight; }
+    });
+    return true;
+  });
   const send = async () => {
     if (!sessionId || sending || speechBusy || readingAttachments || (!draft.trim() && !attachments.length)) return;
     const submissionSession = sessionId;
@@ -2786,6 +2810,7 @@ function App() {
         void addFiles(files);
       }}
     >
+      {quoting.toolbar}
       <AmbientBackground preset={appearance.themePreset} mode={appearanceMode} motion={appearance.ambientMotion} />
       {mobileNav && (
         <button
@@ -3135,6 +3160,7 @@ function App() {
                           setDetail({
                             ...detail,
                             next: earlier.next,
+                            activitySummaries: {...earlier.activitySummaries,...detail.activitySummaries},
                             messages: [...earlier.messages, ...detail.messages],
                           });
                         } catch (e) {
@@ -3183,28 +3209,32 @@ function App() {
                       <details className="live-tools history-tools" key={group[0].id}>
                         <summary title="Expand or collapse this group of tool steps">
                           <Icon name="terminal" size={15} />
-                          Worked<span>{group.reduce((n, m) => n + (m.data?.tools?.length ?? 1), 0)} steps</span>
+                          <ActivityLabel label="Worked" summary={detail.activitySummaries?.[activityGroupKey(group)]?.count === group.length ? detail.activitySummaries[activityGroupKey(group)] : undefined} /><span>{group.reduce((n, m) => n + (m.data?.tools?.length ?? 1), 0)} {group.reduce((n, m) => n + (m.data?.tools?.length ?? 1), 0) === 1 ? 'step' : 'steps'}</span>
                           <Icon name="down" size={13} />
                         </summary>
+                        <ActivitySummaryAction sessionId={sessionId!} groupKey={activityGroupKey(group)} messageIds={group.map(message=>message.id)} summary={detail.activitySummaries?.[activityGroupKey(group)]?.count === group.length ? detail.activitySummaries[activityGroupKey(group)] : undefined} notify={notify} />
                         {group.map((message) => (
                           <div className="progress-step" key={message.id} id={`message-${message.id}`}>
                             <div className="progress-step-heading">
                               <Icon name="terminal" size={14} />
                               <strong>
-                                {message.data?.toolName ?? (message.role === 'tool' ? 'Tool output' : 'Tool call')}
+                                {message.data?.activityKey ? 'Tool activity' : (message.data?.toolName ?? (message.role === 'tool' ? 'Tool output' : 'Tool call'))}
                               </strong>
                               <time>{fullTime(message.timestamp)}</time>
                             </div>
                             {message.text && <ProgressContent value={message.text} />}
+                            {message.data?.turnError && <ProgressContent value={message.data.turnError} label="Turn error" />}
                             {message.data?.tools?.map((tool, i) => (
                               <details className="live-tool" key={i}>
                                 <summary title="Inspect the input sent to this tool">
                                   <Icon name="chevron" size={13} />
                                   <span>{tool.name}</span>
                                   <ToolInputPreview input={tool.input} />
-                                  <small>Input</small>
+                                  <small>{tool.status ?? 'Input'}</small>
                                 </summary>
                                 <ProgressContent value={tool.input} label="Input" />
+                                {tool.output && <ProgressContent value={tool.output} />}
+                                {tool.error && <ProgressContent value={tool.error} label="Error" />}
                               </details>
                             ))}
                           </div>
@@ -3241,6 +3271,13 @@ function App() {
                                     : message.source}
                               </span>
                               <time title={fullTime(message.timestamp)}>{ago(message.timestamp)}</time>
+                              {message.role === 'assistant' && current?.origin !== 'openclaw' && message.text.trim() && <button
+                                type="button" className="message-copy quote-message" data-quote-action disabled={sending}
+                                title="Quote selected text, or this entire message" aria-label="Quote message or selected text"
+                                onPointerDown={event=>event.preventDefault()}
+                                onClick={()=>quoting.quote({id:message.id,text:message.text})}>
+                                <QuoteIcon />
+                              </button>}
                               <button
                                 title="Copy this message to the clipboard"
                                 className="message-copy"
@@ -3263,7 +3300,7 @@ function App() {
                                   <ProgressContent value={message.text} />
                                 </details>
                               ) : (
-                                <RichText text={message.text} />
+                                <RichText text={message.text} quoteId={message.role === 'assistant' ? message.id : undefined} />
                               )}{' '}
                               {message.data?.tools?.map((tool, index) => (
                                 <details className="tool-result" key={index}>
@@ -3303,14 +3340,15 @@ function App() {
                       </React.Fragment>
                     ),
                   )}
-                  {detail.live && Object.values(detail.live.tools ?? {}).length > 0 && (
+                  {detail.live && !detail.live.archived && Object.values(detail.live.tools ?? {}).length > 0 && (
                     <details className="live-tools" open={detail.live.running}>
                       <summary title="Expand or collapse the agent’s tool activity">
                         <Icon name="terminal" size={15} />
-                        {detail.live.running ? 'Working' : 'Worked'}
-                        <span>{Object.values(detail.live.tools).length} steps</span>
+                        <ActivityLabel label={detail.live.running ? 'Working' : 'Worked'} summary={detail.live.running ? undefined : detail.activitySummaries?.[liveActivityKey(detail.live)]} />
+                        <span>{Object.values(detail.live.tools).length} {Object.values(detail.live.tools).length === 1 ? 'step' : 'steps'}</span>
                         <Icon name="down" size={13} />
                       </summary>
+                      {!detail.live.running && <ActivitySummaryAction sessionId={sessionId!} groupKey={liveActivityKey(detail.live)} summary={detail.activitySummaries?.[liveActivityKey(detail.live)]} notify={notify} />}
                       {Object.values(detail.live.tools).map((tool) => (
                         <details className="live-tool" key={tool.id}>
                           <summary title="Inspect this tool’s input, output and status">
@@ -3346,7 +3384,7 @@ function App() {
                         const visible = /<message(?:\s[^>]*)?>([\s\S]*)/
                           .exec(text)?.[1]
                           ?.replace(/<\/message>[\s\S]*$/, '');
-                        return visible ? <RichText key={index} text={visible} /> : null;
+                        return visible ? <RichText key={index} text={visible} quoteId={`live:${sessionId}:${index}`} /> : null;
                       })}
                     </div>
                   )}
@@ -3998,24 +4036,37 @@ function App() {
       )}
       {modal === 'rename' && current && (
         <Dialog title="Rename conversation" close={() => setModal(null)}>
-          <div className="form-body" role="region" aria-label="Form fields" tabIndex={0}>
+          <form id="rename-conversation" className="form-body" aria-label="Rename conversation" onSubmit={async (event) => {
+            event.preventDefault();
+            if (renameSaving || !rename.trim()) return;
+            setRenameSaving(true);
+            try {
+              await api(`/sessions/${current.id}`, 'PATCH', {title: rename.trim()});
+              setModal(null);
+              await refresh();
+            } catch (error) {
+              notify(String(error));
+            } finally {
+              setRenameSaving(false);
+            }
+          }}>
             <label>
               Title
               <input
+                data-autofocus
                 value={rename}
                 maxLength={200}
+                disabled={renameSaving}
                 onChange={(e) => setRename(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && rename.trim()) {
-                    void mutateSession({ title: rename });
-                    setModal(null);
-                  }
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && event.nativeEvent.isComposing) event.preventDefault();
                 }}
               />
             </label>
-          </div>
+          </form>
           <div className="modal-footer">
             <button
+              type="button"
               title="Cancel renaming this conversation"
               className="button secondary"
               onClick={() => setModal(null)}
@@ -4023,15 +4074,13 @@ function App() {
               Cancel
             </button>
             <button
+              type="submit"
+              form="rename-conversation"
               title="Save the new conversation title"
               className="button primary"
-              disabled={!rename.trim()}
-              onClick={() => {
-                void mutateSession({ title: rename });
-                setModal(null);
-              }}
+              disabled={renameSaving || !rename.trim()}
             >
-              Save title
+              {renameSaving ? 'Saving…' : 'Save title'}
             </button>
           </div>
         </Dialog>

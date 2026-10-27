@@ -7,7 +7,7 @@ import { DEFAULT_SPEECH } from './types.js';
 vi.mock('node:child_process', () => ({ execFile: vi.fn() }));
 fs.mkdirSync(path.resolve('.cache'), { recursive: true });
 const root = fs.mkdtempSync(path.resolve('.cache/speech-test-'));
-const settings = { ...DEFAULT_SPEECH, executable: process.execPath };
+const settings = { ...DEFAULT_SPEECH, backend: 'mywhispr' as const, enabled: true, executable: process.execPath };
 afterEach(() => {
   vi.resetAllMocks();
   for (const f of fs.readdirSync(root)) fs.rmSync(path.join(root, f), { recursive: true, force: true });

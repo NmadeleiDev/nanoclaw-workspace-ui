@@ -902,6 +902,17 @@ code {
   margin: 0 auto;
   padding: 34px 0 38px;
 }
+/* Keep prose readable while giving each speaker a distinct side. */
+.message,
+.live-answer {
+  width: min(88%, 42rem, 680px);
+  min-width: 0;
+  margin-right: auto;
+}
+.message.user {
+  margin-left: auto;
+  margin-right: 0;
+}
 .message {
   padding: 0 0 32px;
 }
@@ -3276,6 +3287,10 @@ label > textarea {
   .message-content {
     margin-left: 0;
   }
+  .message,
+  .live-answer {
+    width: 100%;
+  }
   .message {
     padding-bottom: 25px;
   }
@@ -4310,14 +4325,10 @@ label > textarea {
 .scratchpad-full-preview { min-height: 0; overscroll-behavior: contain; }
 .scratchpad .scratchpad-full-preview .markdown { font-size: 1rem; }
 
-/* Unread replies are distinct from the green running-agent indicator. */
-.session-row.unread { color:var(--text); font-weight:650; }
-.session-row.unread:not(.selected) { background:color-mix(in srgb, var(--accent) 10%, transparent); }
-.session-row.unread::before { content:''; position:absolute; left:7px; top:25%; height:50%; width:3px; border-radius:3px; background:var(--accent); }
-.session-unread-badge { display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; min-width:24px; min-height:24px; padding:2px 7px; border-radius:8px; background:var(--accent); color:var(--accent-text); font-size:.75rem; font-weight:700; line-height:1.25; white-space:nowrap; }
-.recent-sessions > button.unread, .overview-sessions > button.unread { background:color-mix(in srgb, var(--accent) 9%, transparent); border-radius:8px; box-shadow:inset 3px 0 var(--accent); }
-.recent-sessions > button.unread strong, .overview-sessions > button.unread strong { font-weight:700; }
-.recent-sessions > button.unread .recent-icon { color:var(--accent); background:var(--accent-bg); }
+/* Unread replies use quiet typography and a count, separate from running status. */
+.session-row.unread { color:var(--text); font-weight:500; }
+.session-unread-badge { display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; min-width:18px; min-height:18px; padding:1px 5px; border-radius:5px; background:color-mix(in srgb, var(--muted) 10%, transparent); color:var(--muted); font-size:.7rem; font-weight:500; line-height:1.25; white-space:nowrap; }
+.recent-sessions > button.unread strong, .overview-sessions > button.unread strong { font-weight:600; }
 .recent-sessions > button > .session-unread-badge, .overview-sessions > button > .session-unread-badge { margin-left:4px; }
 
 .latest-message-preview { display:block; margin-top:7px; color:var(--muted); font-size:.85rem; line-height:1.5; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -4341,3 +4352,39 @@ label > textarea {
 }
 .connection-notice > span { flex: 1 1 220px; }
 .connection-notice button { min-height: 44px; flex-shrink: 0; }
+
+.live-tools > summary > .activity-label {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  font-size: .875rem;
+  flex: 1;
+}
+.activity-label strong { font-weight: 500; }
+.activity-label small { color: var(--text); font-size: .875rem; line-height: 1.5; overflow-wrap: anywhere; }
+.live-tools > summary > span:not(.activity-label), .live-tools > summary > svg { flex-shrink: 0; }
+.activity-summary-action { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:8px 12px; font-size:.875rem; }
+.activity-summary-action > span { color:var(--muted); }
+.activity-summary-action button { min-height:44px; }
+
+.quote-selection-button {
+  position: fixed;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  max-width: calc(100vw - 24px);
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--accent-text);
+  box-shadow: var(--shadow);
+  font-size: .875rem;
+  font-weight: 600;
+}
+.message-meta:has(.quote-message) { flex-wrap: wrap; }
+.quote-message { min-width: 32px; min-height: 32px; justify-content: center; }
+@media (pointer: coarse) { .quote-message { opacity: 1; min-width: 44px; min-height: 44px; } }

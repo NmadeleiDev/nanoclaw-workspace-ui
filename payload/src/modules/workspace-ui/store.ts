@@ -61,7 +61,10 @@ export class WorkspaceStore {
 
   async settings(): Promise<WorkspaceSettings> {
     const row = await this.db.get<{ value: string }>('SELECT value FROM ws_settings WHERE id = ?', 'workspace');
-    return row ? { ...structuredClone(DEFAULT_SETTINGS), ...JSON.parse(row.value) } : structuredClone(DEFAULT_SETTINGS);
+    if (!row) return structuredClone(DEFAULT_SETTINGS);
+    const value = { ...structuredClone(DEFAULT_SETTINGS), ...JSON.parse(row.value) };
+    value.speech = parseSpeech(value.speech);
+    return value;
   }
 
   async saveSettings(input: Partial<WorkspaceSettings>): Promise<WorkspaceSettings> {
@@ -80,7 +83,7 @@ export class WorkspaceStore {
     value.utility = parseProfile(value.utility);
     value.overrides = Object.fromEntries(
       Object.entries(value.overrides).map(([key, profile]) => {
-        if (!['title', 'session-summary', 'project-summary'].includes(key))
+        if (!['title', 'session-summary', 'project-summary', 'activity-summary'].includes(key))
           throw new WorkspaceError(400, 'Unknown utility task.');
         return [key, parseProfile(profile)];
       }),
@@ -290,6 +293,24 @@ export class WorkspaceStore {
     ).map(scratchpad);
   }
 
+  /** Seed only placeholder titles; generated and human titles are authoritative. */
+  async seedMessageTitle(id: string): Promise<void> {
+    const first = await this.db.get<{text:string;files:string}>(
+      `SELECT m.text,m.files FROM ws_sessions s JOIN ws_messages m ON m.id=(
+        SELECT id FROM ws_messages WHERE session_id=s.id AND role='user' ORDER BY timestamp,id LIMIT 1
+      ) WHERE s.id=? AND s.title='New conversation' AND s.custom_title=0 AND s.origin<>'openclaw'`, id,
+    );
+    if (!first) return;
+    const files = JSON.parse(first.files) as Array<{name?:string}>;
+    const text = (first.text.trim() || files[0]?.name || '').replace(/\s+/gu,' ').trim();
+    if (!text) return;
+    const characters = Array.from(text);
+    const title = characters.length > 80 ? characters.slice(0,79).join('') + '…' : text;
+    await this.db.run(
+      "UPDATE ws_sessions SET title=? WHERE id=? AND title='New conversation' AND custom_title=0 AND origin<>'openclaw'",title,id,
+    );
+  }
+
   async putMessage(message: WorkspaceMessage): Promise<boolean> {
     const result = await this.db.run(
       `INSERT INTO ws_messages (id,session_id,role,kind,text,timestamp,source,files,data)
@@ -311,6 +332,7 @@ export class WorkspaceStore {
         message.timestamp,
         message.sessionId,
       );
+    if (result.changes && message.role === 'user') await this.seedMessageTitle(message.sessionId);
     return result.changes > 0;
   }
 

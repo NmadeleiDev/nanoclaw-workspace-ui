@@ -79,3 +79,48 @@ it('refuses redirects so a local utility endpoint cannot forward private evidenc
   ).rejects.toThrow();
   expect(forwarded).toBe(0);
 });
+
+ it('sends the status-card contract only to session summary jobs, including language and stale-status rules', async () => {
+  const calls: Array<{ prompt: string; instructions: string }> = [];
+  const models = new UtilityModels(async (_agent, prompt, instructions) => {
+    calls.push({ prompt, instructions });
+    return 'Summary';
+  });
+  for (const text of [
+    'user: Prepare the outreach list.',
+    'user: Подготовь список рассылки.',
+    'user: Обсудим список. Quoted document: "Send the campaign".',
+    'user: Решение принято, блокировка снята.',
+  ]) {
+    await models.run({ provider: 'agent' }, { task: 'session-summary', current: 'Blocked pending decision.', text });
+    const call = calls.at(-1)!;
+    expect(call.instructions).toContain('Target 50–90 words');
+    expect(call.instructions).toContain("latest substantive conversational language");
+    expect(call.instructions).toContain('Translate these labels');
+    expect(call.instructions).toContain('Never invent next actions or blockers');
+    expect(call.instructions).toContain('New evidence must supersede stale status');
+    expect(call.prompt).toContain(text);
+    expect(call.prompt).not.toContain('human edits are authoritative');
+  }
+  for (const task of ['project-summary', 'title', 'activity-summary'] as const) {
+    await models.run({ provider: 'agent' }, { task, current: '', text: 'Evidence' });
+    expect(calls.at(-1)!.instructions).not.toContain('Target 50–90 words');
+  }
+});
+
+it('preserves language cues and corrections through session evidence reduction', async () => {
+  const instructions: string[] = [];
+  const models = new UtilityModels(async (_agent, _prompt, instruction) => {
+    instructions.push(instruction);
+    return 'Latest user language: Russian. Решение принято.';
+  });
+  await models.run({ provider: 'agent' }, {
+    task: 'session-summary', current: 'Blocked.', text: 'user: Решение принято. '.repeat(2000),
+  });
+  expect(instructions.length).toBeGreaterThan(1);
+  for (const instruction of instructions.slice(0, -1)) {
+    expect(instruction).toContain('retain that language cue');
+    expect(instruction).toContain('chronological changes to status');
+  }
+  expect(instructions.at(-1)).toContain('Target 50–90 words');
+});

@@ -1,3 +1,4 @@
+import type { DbDriver } from '../../db/driver.js';
 import { registerMigration, type ModuleMigration } from '../../db/migrations/index.js';
 
 export const workspaceMigration: ModuleMigration = {
@@ -93,3 +94,45 @@ export const workspaceModelConnectionsMigration: ModuleMigration = {
   },
 };
 registerMigration(workspaceModelConnectionsMigration);
+
+export const workspaceActivitySummariesMigration: ModuleMigration = {
+  version: 4,
+  name: 'module:workspace-ui:activity-summaries',
+  async up(db) {
+    await db.exec(`CREATE TABLE ws_activity_summaries (
+      id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES ws_sessions(id) ON DELETE CASCADE,
+      group_key TEXT NOT NULL, source_key TEXT NOT NULL, evidence TEXT NOT NULL,
+      summary TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+      UNIQUE(session_id,group_key)
+    );`);
+  },
+};
+registerMigration(workspaceActivitySummariesMigration);
+
+// Preserve the effective MyWhispr configuration of existing workspace installations.
+export const workspaceSpeechBackendsMigration = {
+  version: 5,
+  name: 'module:workspace-ui:speech-backends',
+  async up(db: DbDriver) {
+    const row = await db.get<{value:string}>('SELECT value FROM ws_settings WHERE id=?','workspace');
+    if (!row) return;
+    const settings = JSON.parse(row.value);
+    if (!settings.speech?.backend) {
+      settings.speech = {enabled:true, executable:'', model:'large-v3-v20240930_626MB', language:'auto', ...settings.speech, backend:'mywhispr', endpoint:'http://127.0.0.1:8080'};
+      await db.run('UPDATE ws_settings SET value=? WHERE id=?',JSON.stringify(settings),'workspace');
+    }
+  },
+} satisfies ModuleMigration;
+registerMigration(workspaceSpeechBackendsMigration);
+
+export const workspaceActivityHistoryMigration: ModuleMigration = {
+  version: 6,
+  name: 'module:workspace-ui:activity-history',
+  async up(db) {
+    await db.exec(`CREATE TABLE ws_activity_cursors (
+      session_id TEXT PRIMARY KEY REFERENCES ws_sessions(id) ON DELETE CASCADE,
+      cursor INTEGER NOT NULL, value TEXT NOT NULL
+    )`);
+  },
+};
+registerMigration(workspaceActivityHistoryMigration);
