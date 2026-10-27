@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/NmadeleiDev/nanoclaw-workspace-ui/security/advisories/new
+    about: Please do not report exploitable vulnerabilities in public issues.

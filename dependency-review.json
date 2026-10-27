@@ -1,0 +1,132 @@
+{
+  "checkedAt": "2026-10-27T12:28:09.656625Z",
+  "sources": [
+    "https://registry.npmjs.org/",
+    "https://osv.dev/",
+    "https://github.com/vitest-dev/vitest/security/advisories/GHSA-qxg6-89mg-rqv8"
+  ],
+  "packages": [
+    {
+      "package": "react",
+      "version": "19.3.1",
+      "latestStable": "19.3.1",
+      "deprecated": false,
+      "engines": {
+        "node": ">=0.10.0"
+      },
+      "license": "MIT",
+      "registry": "https://registry.npmjs.org/react/19.3.1",
+      "knownAdvisories": []
+    },
+    {
+      "package": "react-dom",
+      "version": "19.3.1",
+      "latestStable": "19.3.1",
+      "deprecated": false,
+      "engines": {},
+      "license": "MIT",
+      "registry": "https://registry.npmjs.org/react-dom/19.3.1",
+      "knownAdvisories": []
+    },
+    {
+      "package": "react-markdown",
+      "version": "10.1.0",
+      "latestStable": "10.1.0",
+      "deprecated": false,
+      "engines": {},
+      "license": "MIT",
+      "registry": "https://registry.npmjs.org/react-markdown/10.1.0",
+      "knownAdvisories": []
+    },
+    {
+      "package": "remark-gfm",
+      "version": "4.0.1",
+      "latestStable": "4.0.1",
+      "deprecated": false,
+      "engines": {},
+      "license": "MIT",
+      "registry": "https://registry.npmjs.org/remark-gfm/4.0.1",
+      "knownAdvisories": []
+    },
+    {
+      "package": "@types/react",
+      "version": "19.3.0",
+      "latestStable": "19.3.0",
+      "deprecated": false,
+      "engines": {},
+      "license": "MIT",
+      "registry": "https://registry.npmjs.org/%40types%2Freact/19.3.0",
+      "knownAdvisories": []
+    },
+    {
+      "package": "@types/react-dom",
+      "version": "19.3.0",
+      "latestStable": "19.3.0",
+      "deprecated": false,
+      "engines": {},
+      "license": "MIT",
+      "registry": "https://registry.npmjs.org/%40types%2Freact-dom/19.3.0",
+      "knownAdvisories": []
+    },
+    {
+      "package": "vite",
+      "version": "8.3.5",
+      "latestStable": "8.3.5",
+      "deprecated": false,
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      },
+      "license": "MIT",
+      "registry": "https://registry.npmjs.org/vite/8.3.5",
+      "knownAdvisories": []
+    },
+    {
+      "package": "web-push",
+      "version": "3.6.7",
+      "latestStable": "3.6.7",
+      "deprecated": false,
+      "engines": {
+        "node": ">= 16"
+      },
+      "license": "MPL-2.0",
+      "registry": "https://registry.npmjs.org/web-push/3.6.7",
+      "knownAdvisories": []
+    },
+    {
+      "package": "@types/web-push",
+      "version": "3.6.4",
+      "latestStable": "3.6.4",
+      "deprecated": false,
+      "engines": {},
+      "license": "MIT",
+      "registry": "https://registry.npmjs.org/%40types%2Fweb-push/3.6.4",
+      "knownAdvisories": []
+    },
+    {
+      "package": "vitest",
+      "version": "4.1.12",
+      "latestStable": "5.0.5",
+      "deprecated": false,
+      "engines": {
+        "node": "^20.0.0 || ^22.0.0 || >=24.0.0"
+      },
+      "license": "MIT",
+      "registry": "https://registry.npmjs.org/vitest/4.1.12",
+      "knownAdvisories": [],
+      "selectionReason": "Maintained V4 security backport preserves the tested upstream major-version contract; V5 is a separate migration."
+    }
+  ],
+  "resolvedLockfileAudit": {
+    "checkedAt": "2026-10-27T12:35:28.886218Z",
+    "tool": "pnpm audit",
+    "vulnerabilities": {
+      "info": 0,
+      "low": 0,
+      "moderate": 0,
+      "high": 0,
+      "critical": 0
+    },
+    "lockfileSha256": "2f787d9f4635025c88a4b0623fc48a7533f0ab983daa8fd4036a63e2c2ef1909",
+    "scope": "Freshly resolved upstream plus UI workspace; no private package overrides or install data."
+  }
+}

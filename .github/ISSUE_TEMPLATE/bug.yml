@@ -1,0 +1,22 @@
+name: Bug report
+description: Report a reproducible workspace problem
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include steps, expected behavior and actual behavior. Use fictional data.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Versions and environment
+      description: Add-on version, NanoClaw commit, OS, browser, and localhost or tailnet access.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Sanitized errors or screenshots. Remove personal paths, conversations, pairing links and secrets.

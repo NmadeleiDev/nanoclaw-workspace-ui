@@ -1,0 +1,1176 @@
+diff --git a/container/agent-runner/src/config.ts b/container/agent-runner/src/config.ts
+index 6aad079..52cfb56 100644
+--- a/container/agent-runner/src/config.ts
++++ b/container/agent-runner/src/config.ts
+@@ -21,6 +21,8 @@ export interface RunnerConfig {
+   model?: string;
+   effort?: string;
+   speed?: ProviderSpeed;
++  workspaceWorkingDirectory?: string;
++  workspaceUtility?: boolean;
+ }
+ 
+ const DEFAULT_MAX_MESSAGES = 10;
+@@ -37,7 +39,7 @@ export function loadConfig(): RunnerConfig {
+   let raw: Record<string, unknown> = {};
+   try {
+     raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+-  } catch {
++  } catch (error) {
+     console.error(`[config] Failed to read ${CONFIG_PATH}, using defaults`);
+   }
+ 
+@@ -49,6 +51,8 @@ export function loadConfig(): RunnerConfig {
+ /** Build the runner config from a parsed container.json; missing fields take their defaults. */
+ export function runnerConfigFromRaw(raw: Record<string, unknown>): RunnerConfig {
+   return {
++    workspaceWorkingDirectory: typeof raw.workspaceWorkingDirectory === 'string' ? raw.workspaceWorkingDirectory : undefined,
++    workspaceUtility: raw.workspaceUtility === true,
+     provider: (raw.provider as string) || 'claude',
+     assistantName: (raw.assistantName as string) || '',
+     groupName: (raw.groupName as string) || '',
+diff --git a/container/agent-runner/src/index.ts b/container/agent-runner/src/index.ts
+index 811a583..1c76d45 100644
+--- a/container/agent-runner/src/index.ts
++++ b/container/agent-runner/src/index.ts
+@@ -62,7 +62,7 @@ async function main(): Promise<void> {
+ 
+   // Every provider shares one persistent memory tree. Legacy imports are an
+   // operator-run migration and never happen in this normal startup path.
+-  ensureMemoryScaffold();
++  if (!config.workspaceUtility) ensureMemoryScaffold();
+ 
+   // The agent browser trusts only NSS, not the gateway CA env vars.
+   trustGatewayCaForChromium({ log });
+@@ -102,7 +102,7 @@ async function main(): Promise<void> {
+   const mcpServers: Record<string, McpServerConfig> = {
+     nanoclaw: {
+       command: 'bun',
+-      args: ['run', mcpServerPath],
++      args: ['run', '--no-env-file', mcpServerPath],
+       env: {},
+     },
+   };
+@@ -120,7 +120,8 @@ async function main(): Promise<void> {
+ 
+   const provider = createProvider(providerName, {
+     assistantName: config.assistantName || undefined,
+-    mcpServers,
++    utilityMode: config.workspaceUtility,
++    mcpServers: config.workspaceUtility ? {} : mcpServers,
+     env: { ...process.env },
+     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
+     model: config.model,
+@@ -130,12 +131,19 @@ async function main(): Promise<void> {
+   registerProviderMemorySessionHook(providerName, provider, MEMORY_SESSION_HOOK);
+ 
+   try {
++    if (config.workspaceUtility) {
++      const { runWorkspaceUtilities } = await import('./workspace-utilities.js');
++      await runWorkspaceUtilities(provider);
++      return;
++    }
++    const cwd = config.workspaceWorkingDirectory || CWD;
++    const { agentInstructionsForWorkingDirectory } = await import('./workspace-context.js');
+     await runPollLoop({
+       provider,
+       providerContract: getProviderRuntimeContract(providerName),
+       providerName,
+-      cwd: CWD,
+-      systemContext: { instructions },
++      cwd,
++      systemContext: { instructions: [agentInstructionsForWorkingDirectory(cwd), instructions].filter(Boolean).join("\n\n") },
+     });
+   } finally {
+     await mailbox.stop();
+diff --git a/container/agent-runner/src/mailbox/sqlite/connection.ts b/container/agent-runner/src/mailbox/sqlite/connection.ts
+index 33d509b..6021ae4 100644
+--- a/container/agent-runner/src/mailbox/sqlite/connection.ts
++++ b/container/agent-runner/src/mailbox/sqlite/connection.ts
+@@ -22,8 +22,8 @@
+  */
+ import { Database } from 'bun:sqlite';
+ 
+-const DEFAULT_INBOUND_PATH = '/workspace/inbound.db';
+-const DEFAULT_OUTBOUND_PATH = '/workspace/outbound.db';
++const DEFAULT_INBOUND_PATH = `/workspace/inbound.db`;
++const DEFAULT_OUTBOUND_PATH = `/workspace/outbound.db`;
+ 
+ let _inbound: Database | null = null;
+ let _outbound: Database | null = null;
+@@ -105,6 +105,7 @@ export function getOutboundDb(path = DEFAULT_OUTBOUND_PATH): Database {
+       );
+     }
+     _outbound.exec(`UPDATE session_state SET updated_at = '1970-01-01T00:00:00.000Z' WHERE updated_at = ''`);
++    _outbound.exec('CREATE TABLE IF NOT EXISTS workspace_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL)');
+     // container_state: tracks the current tool in flight (if any) so the host
+     // sweep can widen its stuck tolerance when Bash is running with a user-
+     // declared long timeout. Forward-compat for older outbound.db files.
+diff --git a/container/agent-runner/src/mailbox/sqlite/index.ts b/container/agent-runner/src/mailbox/sqlite/index.ts
+index ec5ef0c..14cd183 100644
+--- a/container/agent-runner/src/mailbox/sqlite/index.ts
++++ b/container/agent-runner/src/mailbox/sqlite/index.ts
+@@ -1,6 +1,7 @@
+ import {
+   closeSessionDb,
+   readInbound,
++  getOutboundDb,
+   sqliteClearContainerToolInFlight,
+   sqliteClearStaleProcessingAcks,
+   sqliteSetContainerToolInFlight,
+@@ -113,6 +114,17 @@ export class SqliteAgentMailbox implements AgentMailbox {
+     closeSessionDb();
+   }
+ 
++  workspaceContext(): { value: string; control: string | null } | null {
++    return readInbound((db) => {
++      if (!db.query("SELECT 1 FROM sqlite_master WHERE name='workspace_context'").get()) return null;
++      return db.query('SELECT value,control FROM workspace_context WHERE id=1').get() as {value: string; control: string | null} | null;
++    });
++  }
++
++  writeWorkspaceEvent(kind: string, content: string): void {
++    getOutboundDb().query('INSERT INTO workspace_events (timestamp,kind,content) VALUES (?,?,?)').run(new Date().toISOString(),kind,content);
++  }
++
+   getPendingMessages(limit: number, isFirstPoll: boolean): InboundMessage[] {
+     return sqliteGetPendingMessages(isFirstPoll, limit).flatMap((row) => {
+       const message = parseInboundMessage(row);
+diff --git a/container/agent-runner/src/mailbox/types.ts b/container/agent-runner/src/mailbox/types.ts
+index e477362..e71d47f 100644
+--- a/container/agent-runner/src/mailbox/types.ts
++++ b/container/agent-runner/src/mailbox/types.ts
+@@ -44,6 +44,8 @@ export type OutboundMessageDraft = OutboundWrite;
+ export type StateValue = Omit<StateRecord, 'key'>;
+ 
+ export interface MailboxOperations {
++  workspaceContext?(): { value: string; control: string | null } | null;
++  writeWorkspaceEvent?(kind: string, content: string): void;
+   getPendingMessages(limit: number, isFirstPoll: boolean): InboundMessage[];
+   markMessages(ids: string[], status: ProcessingStatus): void;
+   markScriptSkipped(skips: Array<{ id: string; reason: string }>): void;
+diff --git a/container/agent-runner/src/mcp-tools/index.ts b/container/agent-runner/src/mcp-tools/index.ts
+index 592bf74..cfe4ede 100644
+--- a/container/agent-runner/src/mcp-tools/index.ts
++++ b/container/agent-runner/src/mcp-tools/index.ts
+@@ -9,6 +9,7 @@ import './core.js';
+ import './interactive.js';
+ import './agents.js';
+ import './self-mod.js';
++import './workspace.js';
+ // Module barrel — loads registration modules, including the singular mailbox slot.
+ import '../modules/index.js';
+ import { getAgentMailbox, readMailboxContext } from '../mailbox/index.js';
+diff --git a/container/agent-runner/src/mcp-tools/interactive.test.ts b/container/agent-runner/src/mcp-tools/interactive.test.ts
+index 859ee3f..8de0054 100644
+--- a/container/agent-runner/src/mcp-tools/interactive.test.ts
++++ b/container/agent-runner/src/mcp-tools/interactive.test.ts
+@@ -296,6 +296,19 @@ describe('send_card', () => {
+     }
+   });
+ 
++  it('preserves URL character acceptance with the portable DeepSeek pattern', () => {
++    const re = new RegExp(LINK_ACTION_SCHEMA.properties.url.pattern);
++    for (let code = 0; code < 128; code++) {
++      const char = String.fromCharCode(code);
++      const printable = code >= 33 && code <= 126 && char !== '"' && char !== '\\';
++      expect(re.test(`https://${char}x`)).toBe(printable && !['#', '/', '?'].includes(char));
++      expect(re.test(`https://example.com/${char}x`)).toBe(printable);
++    }
++    expect(re.test('https://[::1]:8080/path')).toBe(true);
++    // The provider rejects escaped closing brackets inside a character class.
++    expect(LINK_ACTION_SCHEMA.properties.url.pattern).not.toContain('\\]-');
++  });
++
+   it('constrains children to text instead of promising nested action blocks', () => {
+     const cardSchema = sendCard.tool.inputSchema.properties.card as {
+       properties: { children: { description: string; items: { anyOf: Array<Record<string, unknown>> } } };
+diff --git a/container/agent-runner/src/mcp-tools/interactive.ts b/container/agent-runner/src/mcp-tools/interactive.ts
+index 41ec84e..8802b81 100644
+--- a/container/agent-runner/src/mcp-tools/interactive.ts
++++ b/container/agent-runner/src/mcp-tools/interactive.ts
+@@ -73,11 +73,13 @@ export const LINK_ACTION_SCHEMA = Object.freeze({
+     // schema-to-grammar converter rejects those escapes and fails every request
+     // that carries this tool. The classes also leave out '"' and '\\', which
+     // the converter would otherwise copy into the JSON string rule. The first
+-    // host character excludes '#', '/' and '?'. Non-ASCII URLs are normalized
++    // host character excludes '#', '/' and '?'. Brackets use alternatives:
++    // BytePlus DeepSeek rejects escaped closing brackets inside character
++    // classes, even though JavaScript accepts them. Non-ASCII URLs are normalized
+     // with `new URL()` before validation (see normalizeLinkUrl).
+     url: {
+       type: 'string' as const,
+-      pattern: '^[hH][tT][tT][pP][sS]?://[!$-.0->@-[\\]-~][!#-[\\]-~]*$',
++      pattern: '^[hH][tT][tT][pP][sS]?://([!$-.0->@-Z^-~]|\\[|\\])([!#-Z^-~]|\\[|\\])*$',
+       description: "Web link (http or https), e.g. 'https://example.com'.",
+     },
+     style: {
+diff --git a/container/agent-runner/src/memory/scaffold.wiring.test.ts b/container/agent-runner/src/memory/scaffold.wiring.test.ts
+index 359cb94..a7ff632 100644
+--- a/container/agent-runner/src/memory/scaffold.wiring.test.ts
++++ b/container/agent-runner/src/memory/scaffold.wiring.test.ts
+@@ -9,8 +9,8 @@ import path from 'path';
+ describe('memory scaffold boot wiring', () => {
+   const indexSrc = fs.readFileSync(path.join(import.meta.dir, '..', 'index.ts'), 'utf-8');
+ 
+-  it('scaffolds memory unconditionally in main()', () => {
+-    expect(indexSrc).toMatch(/\n\s*ensureMemoryScaffold\(\);/);
++  it('scaffolds normal agents and bypasses memory only for utility sessions', () => {
++    expect(indexSrc).toMatch(/if \(!config\.workspaceUtility\) ensureMemoryScaffold\(\);/);
+     expect(indexSrc).not.toContain('usesMemoryScaffold');
+   });
+ 
+diff --git a/container/agent-runner/src/poll-loop.ts b/container/agent-runner/src/poll-loop.ts
+index e4d7982..2c1662b 100644
+--- a/container/agent-runner/src/poll-loop.ts
++++ b/container/agent-runner/src/poll-loop.ts
+@@ -1,3 +1,5 @@
++import { randomUUID } from 'node:crypto';
++import { renderWorkspaceContext, emitWorkspaceEvent, acknowledgeWorkspaceReconfigure, holdWorkspaceReconfigure } from './workspace-context.js';
+ import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
+ import {
+   getPendingMessages,
+@@ -125,6 +127,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+   let pollCount = 0;
+   let isFirstPoll = true;
+   while (true) {
++    if (config.signal?.aborted) return;
++    await holdWorkspaceReconfigure(config.signal);
+     if (config.signal?.aborted) return;
+     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
+     const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+@@ -240,7 +244,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
+ 
+     const query = config.provider.query({
+-      prompt,
++      prompt: prompt + renderWorkspaceContext(),
+       continuation,
+       cwd: config.cwd,
+       systemContext: config.systemContext,
+@@ -403,6 +407,9 @@ export async function processQuery(
+   // this?" truth lives in the outbound DB the door already writes to — no
+   // in-process delivery ledger. Reset alongside midTurnSent at each result.
+   let turnStartSeq = maxOutboundSeq();
++  let notificationId: string = randomUUID();
++  let notificationRanges: SeqWindow[] = [];
++  let retryScheduled = false;
+   // Cross-segment assembly buffer: the unresolved TAIL of the previous text
+   // event — an unclosed <message …> block (or a bare open-tag prefix like
+   // "<mess" literally split mid-token), or an unclosed <internal span. Frame-
+@@ -426,6 +433,8 @@ export async function processQuery(
+   // archivePrompts. An empty initial prompt (a pre-warmed query) starts idle.
+   let answering = initialPrompt !== '';
+   type QueuedTurn = {
++    notificationId?: string;
++    notificationRanges?: SeqWindow[];
+     routing: RoutingContext;
+     unwrappedNudged: boolean;
+     taskBlockNudged: boolean;
+@@ -438,17 +447,21 @@ export async function processQuery(
+   let nudgedWindow: SeqWindow | undefined;
+   const adoptTurn = (next: QueuedTurn): void => {
+     Object.assign(routing, next.routing);
++    notificationId = next.notificationId ?? randomUUID();
++    notificationRanges = next.notificationRanges ?? [];
+     unwrappedNudged = next.unwrappedNudged;
+     taskBlockNudged = next.taskBlockNudged;
+     nudgedWindow = next.nudgedWindow;
+     publishReplyRoute(routing);
+     answering = true;
++    emitWorkspaceEvent('turn-start', { queryStartedAt: Date.now() });
+   };
+   // A retry is another provider input, behind any follow-ups already pushed.
+   // Preserve its original route, prompt and retry guards until it is answered.
+   const pushRetry = (prompt: string, retryOf?: SeqWindow): void => {
++    retryScheduled = true;
+     query.push(prompt);
+-    queuedTurns.push({ routing: { ...routing }, unwrappedNudged, taskBlockNudged, nudgedWindow: retryOf });
++    queuedTurns.push({ notificationId, notificationRanges: [...notificationRanges, {after:turnStartSeq,upto:maxOutboundSeq()}], routing: { ...routing }, unwrappedNudged, taskBlockNudged, nudgedWindow: retryOf });
+     archivePrompts.push(archivePrompts[0] ?? initialPrompt);
+   };
+ 
+@@ -502,6 +515,20 @@ export async function processQuery(
+         // follow-up is also pending; otherwise they stay pending for a future
+         // batch (mirrors the two-phase initial-batch selection in
+         // db/messages-in.ts).
++        const workspaceControl = getAgentMailbox().operations.workspaceContext?.()?.control;
++        if (workspaceControl) {
++          const command = JSON.parse(workspaceControl);
++          if (command.kind === 'cancel' && Date.parse(command.at) >= queryStartedAt) {
++            endedForCommand = true;
++            query.abort();
++            emitWorkspaceEvent('turn-cancelled', {});
++            return;
++          }
++        }
++        if (!answering && acknowledgeWorkspaceReconfigure()) {
++          query.end();
++          return;
++        }
+         const hasFollowUpTrigger = pending.some((m) => m.kind !== 'system' && m.trigger === 1);
+         const newMessages = pending.filter((m) => m.kind !== 'system' && (m.trigger === 1 || hasFollowUpTrigger));
+         if (newMessages.length === 0) return;
+@@ -538,9 +565,10 @@ export async function processQuery(
+         const keptIds = keep.map((m) => m.id);
+         const prompt = formatMessages(keep);
+         log(`Pushing ${keep.length} follow-up message(s) into active query`);
+-        query.push(prompt);
++        query.push(prompt + renderWorkspaceContext());
+         archivePrompts.push(prompt);
+         const next: QueuedTurn = {
++          notificationId: randomUUID(),
+           routing: extractRouting(keep),
+           unwrappedNudged: false,
+           taskBlockNudged: false,
+@@ -580,8 +608,23 @@ export async function processQuery(
+     })();
+   }, ACTIVE_POLL_INTERVAL_MS);
+ 
++  const queryStartedAt = Date.now();
++  emitWorkspaceEvent('turn-start', { queryStartedAt });
+   try {
+     for await (const event of query.events) {
++      const control = getAgentMailbox().operations.workspaceContext?.()?.control;
++      if (control) {
++        const command = JSON.parse(control);
++        if (command.kind === 'cancel' && Date.parse(command.at) >= queryStartedAt) {
++          endedForCommand = true;
++          query.abort();
++          emitWorkspaceEvent('turn-cancelled', {});
++          break;
++        }
++      }
++      if (event.type === 'display') emitWorkspaceEvent(event.kind, { id: event.id, ...event.data });
++      if (event.type === 'result') emitWorkspaceEvent('turn-result', { isError: event.isError ?? false });
++      if (event.type === 'error') emitWorkspaceEvent('turn-error', { message: event.message });
+       handleEvent(event, routing);
+       touchHeartbeat();
+ 
+@@ -609,6 +652,7 @@ export async function processQuery(
+           midTurnTail = scan.tail;
+         }
+       } else if (event.type === 'result') {
++        retryScheduled = false;
+         // A result — with or without text — means the turn is done. Mark
+         // the initial batch completed now so the host sweep doesn't see
+         // stale 'processing' claims while the query stays open for
+@@ -703,6 +747,7 @@ export async function processQuery(
+         // genuinely re-sending the same body still delivers. The assembly
+         // buffer dies with the turn: a fragment that never closed is not
+         // carried into the next turn — the wrap-nudge owns that case.
++        if (!retryScheduled && !endedForCommand && !signal?.aborted) emitWorkspaceEvent('turn-finished', {id:notificationId, failed:event.isError===true, ranges:[...notificationRanges,{after:turnStartSeq,upto:maxOutboundSeq()}]});
+         midTurnSent = 0;
+         midTurnReplied = 0;
+         turnStartSeq = maxOutboundSeq();
+@@ -713,6 +758,7 @@ export async function processQuery(
+         else answering = false;
+       }
+     }
++    if (answering && !endedForCommand && !signal?.aborted) emitWorkspaceEvent('turn-finished', {id:notificationId,failed:true,ranges:[...notificationRanges,{after:turnStartSeq,upto:maxOutboundSeq()}]});
+   } catch (err) {
+     // Freeze the queue before awaiting notices. Follow-ups have already been
+     // acknowledged, so an abandoned queued turn cannot rely on redelivery.
+@@ -755,6 +801,10 @@ export async function processQuery(
+         }
+       }
+     }
++    if (!cancelled) {
++      if (answering) emitWorkspaceEvent('turn-finished', {id:notificationId,failed:true,ranges:[...notificationRanges,{after:turnStartSeq,upto:maxOutboundSeq()}]});
++      for (const turn of queuedTurns) if (turn.notificationId) emitWorkspaceEvent('turn-finished', {id:turn.notificationId,failed:true,ranges:turn.notificationRanges ?? []});
++    }
+     // Continuation recovery receives the original error; diagnostics remain
+     // in the exchange archive and runner log, never in the channel notice.
+     throw err;
+diff --git a/container/agent-runner/src/providers/claude.system-prompt.test.ts b/container/agent-runner/src/providers/claude.system-prompt.test.ts
+index 5686478..37657c2 100644
+--- a/container/agent-runner/src/providers/claude.system-prompt.test.ts
++++ b/container/agent-runner/src/providers/claude.system-prompt.test.ts
+@@ -59,3 +59,29 @@ describe('system prompt append', () => {
+     });
+   });
+ });
++
++it('runs workspace utilities with plain instructions and no project settings, tools, MCP, or memory hooks', async () => {
++  const provider = createProvider('claude', {});
++  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
++  const q = provider.query({
++    utility: true,
++    prompt: 'Summarize quoted evidence',
++    cwd: tmp,
++    systemContext: { instructions: 'Return notes only.' },
++  });
++  for await (const _ of q.events) {
++    /* drain */
++  }
++  expect(lastOptions).toMatchObject({
++    systemPrompt: 'Return notes only.',
++    tools: [],
++    allowedTools: [],
++    settingSources: [],
++    mcpServers: {},
++    hooks: {},
++  });
++  const controller = lastOptions?.abortController as AbortController;
++  expect(controller.signal.aborted).toBe(false);
++  q.abort();
++  expect(controller.signal.aborted).toBe(true);
++});
+diff --git a/container/agent-runner/src/providers/claude.ts b/container/agent-runner/src/providers/claude.ts
+index 1af8142..5311e92 100644
+--- a/container/agent-runner/src/providers/claude.ts
++++ b/container/agent-runner/src/providers/claude.ts
+@@ -262,6 +262,7 @@ export class ClaudeProvider implements AgentProvider {
+ 
+   query(input: QueryInput): AgentQuery {
+     if (!this.memorySessionHook) throw new Error('Claude memory session hook was not registered');
++    const abortController = new AbortController();
+     const stream = new MessageStream();
+     stream.push(input.prompt);
+ 
+@@ -270,19 +271,23 @@ export class ClaudeProvider implements AgentProvider {
+     const sdkResult = sdkQuery({
+       prompt: stream,
+       options: {
++        abortController,
+         cwd: input.cwd,
+         additionalDirectories: this.additionalDirectories,
+         resume: input.continuation,
+-        pathToClaudeCodeExecutable: '/pnpm/claude',
++        pathToClaudeCodeExecutable: '/usr/local/bin/claude',
+         // The append (agent name + destinations) is rebuilt at every container
+         // start. Left to the SDK default, Claude Code records the prompt on a
+         // session's first request and resends that record on every resume, so
+         // a resumed agent would keep its old name and destination list until
+         // compaction. snapshot: false renders it fresh each time.
+-        systemPrompt: instructions
+-          ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions, snapshot: false }
+-          : undefined,
+-        allowedTools: [...this.mcp.allowedTools],
++        systemPrompt: input.utility
++          ? instructions
++          : instructions
++            ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions, snapshot: false }
++            : undefined,
++        ...(input.utility ? { tools: [] as string[] } : {}),
++        allowedTools: input.utility ? [] : [...this.mcp.allowedTools],
+         disallowedTools: [...this.executionPolicy.disallowedTools],
+         // The SDK emits `assistant` only per completed content block, so a long
+         // block is silent and the host sweep kills the container mid-generation.
+@@ -295,19 +300,21 @@ export class ClaudeProvider implements AgentProvider {
+         effort: this.inference.effort as any,
+         permissionMode: this.executionPolicy.permissionMode,
+         allowDangerouslySkipPermissions: this.executionPolicy.allowDangerouslySkipPermissions,
+-        settingSources: ['project', 'user', 'local'],
++        settingSources: input.utility ? [] : ['project', 'user', 'local'],
+         // Flag-level settings: `fastMode` only when the install turns it on,
+         // then the execution policy's fixed keys, spread last so per-group
+         // input can never override them. Both are Settings members rather
+         // than query options, which is why they ride `settings`.
+         settings: { ...this.inference.settings, ...this.executionPolicy.settings },
+-        mcpServers: this.mcp.mcpServers,
+-        hooks: {
+-          PreToolUse: [{ hooks: [preToolUseHook] }],
+-          PostToolUse: [{ hooks: [postToolUseHook] }],
+-          PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+-          PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
+-        },
++        mcpServers: input.utility ? {} : this.mcp.mcpServers,
++        hooks: input.utility
++          ? {}
++          : {
++              PreToolUse: [{ hooks: [preToolUseHook] }],
++              PostToolUse: [{ hooks: [postToolUseHook] }],
++              PostToolUseFailure: [{ hooks: [postToolUseHook] }],
++              PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
++            },
+       },
+     });
+ 
+@@ -323,6 +330,30 @@ export class ClaudeProvider implements AgentProvider {
+         // is working. Deltas arrive per token and carry no content for us, so
+         // they count at most once per second, and not as messages.
+         if (message.type === 'stream_event') {
++          const partial = message as unknown as {
++            event?: {
++              type?: string;
++              index?: number;
++              delta?: { type?: string; text?: string };
++              content_block?: { type?: string; id?: string; name?: string };
++            };
++            uuid?: string;
++          };
++          const part = partial.event;
++          if (part?.delta?.type === 'text_delta' && part.delta.text)
++            yield {
++              type: 'display',
++              kind: 'text-delta',
++              id: `claude-${part.index ?? 0}`,
++              data: { delta: part.delta.text },
++            };
++          if (part?.content_block?.type === 'tool_use')
++            yield {
++              type: 'display',
++              kind: 'tool',
++              id: part.content_block.id ?? `tool-${part.index}`,
++              data: { name: part.content_block.name, status: 'running' },
++            };
+           const now = Date.now();
+           if (now - lastStreamActivityAt < STREAM_ACTIVITY_INTERVAL_MS) continue;
+           lastStreamActivityAt = now;
+@@ -351,15 +382,47 @@ export class ClaudeProvider implements AgentProvider {
+           // result reports. Blocks split across ASSISTANT MESSAGES (a tool
+           // call between them) remain unparseable mid-turn by design; the
+           // poll-loop's midTurnSent===0 fallback and wrap-nudge cover that.
+-          const content = (message as { message?: { content?: Array<{ type?: string; text?: string }> } }).message
+-            ?.content;
++          const content = (
++            message as {
++              message?: {
++                content?: Array<{ type?: string; text?: string; id?: string; name?: string; input?: unknown }>;
++              };
++            }
++          ).message?.content;
+           if (Array.isArray(content)) {
++            for (const block of content)
++              if (block.type === 'tool_use')
++                yield {
++                  type: 'display',
++                  kind: 'tool',
++                  id: block.id ?? 'tool',
++                  data: { name: block.name, input: block.input, status: 'running' },
++                };
+             const text = content
+               .filter((block) => block.type === 'text' && block.text)
+               .map((block) => block.text)
+               .join('');
+             if (text) yield { type: 'text', text };
+           }
++        } else if (message.type === 'user') {
++          const content = (
++            message as unknown as {
++              message?: {
++                content?: Array<{ type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean }>;
++              };
++            }
++          ).message?.content;
++          for (const block of Array.isArray(content) ? content : [])
++            if (block.type === 'tool_result')
++              yield {
++                type: 'display',
++                kind: 'tool',
++                id: block.tool_use_id ?? 'tool',
++                data: {
++                  status: block.is_error ? 'error' : 'completed',
++                  output: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
++                },
++              };
+         } else if (message.type === 'result') {
+           // `result` text exists only on subtype:"success"; error subtypes
+           // (e.g. a non-retryable 403 billing_error) carry their message in
+@@ -433,6 +496,7 @@ export class ClaudeProvider implements AgentProvider {
+       events: translateEvents(),
+       abort: () => {
+         aborted = true;
++        abortController.abort();
+         stream.end();
+       },
+     };
+diff --git a/container/agent-runner/src/providers/types.ts b/container/agent-runner/src/providers/types.ts
+index 9ae9d8e..3a61a92 100644
+--- a/container/agent-runner/src/providers/types.ts
++++ b/container/agent-runner/src/providers/types.ts
+@@ -72,6 +72,7 @@ export interface ProviderExchange {
+  * providers; individual providers may ignore any they don't need.
+  */
+ export interface ProviderOptions {
++  utilityMode?: boolean;
+   assistantName?: string;
+   mcpServers?: Record<string, McpServerConfig>;
+   env?: Record<string, string | undefined>;
+@@ -95,6 +96,7 @@ export interface ProviderOptions {
+ }
+ 
+ export interface QueryInput {
++  utility?: boolean;
+   /** Initial prompt (already formatted by agent-runner). */
+   prompt: string;
+ 
+@@ -154,6 +156,7 @@ export interface AgentQuery {
+ }
+ 
+ export type ProviderEvent =
++  | { type: 'display'; kind: 'text-delta' | 'tool' | 'usage'; id: string; data: Record<string, unknown> }
+   | { type: 'init'; continuation: string }
+   /**
+    * A completed turn. `isError` marks a failed turn and prevents retries.
+diff --git a/src/container-config.ts b/src/container-config.ts
+index 9bb116f..5d12665 100644
+--- a/src/container-config.ts
++++ b/src/container-config.ts
+@@ -9,6 +9,7 @@
+  *   - `configFromDb()` — builds a `ContainerConfig` from a DB row + agent group
+  */
+ import fs from 'fs';
++import { writeAtomic } from './atomic-file.js';
+ import path from 'path';
+ 
+ import { DEFAULT_MODEL, FAST_MODE, GROUPS_DIR, TIMEZONE } from './config.js';
+@@ -237,6 +238,8 @@ export interface AdditionalMountConfig {
+ 
+ /** Shape of the materialized `container.json` file read by the container runner. */
+ export interface ContainerConfig {
++  workspaceWorkingDirectory?: string;
++  workspaceUtility?: boolean;
+   mcpServers: Record<string, McpServerConfig>;
+   packages: { apt: string[]; npm: string[] };
+   imageTag?: string;
+@@ -418,7 +421,7 @@ export async function materializeContainerJson(agentGroupId: string): Promise<Co
+   const p = path.join(GROUPS_DIR, group.folder, 'container.json');
+   const dir = path.dirname(p);
+   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+-  fs.writeFileSync(p, JSON.stringify(config, null, 2) + '\n');
++  writeAtomic(p, JSON.stringify(config, null, 2) + '\n');
+ 
+   return config;
+ }
+diff --git a/src/container-runner.ts b/src/container-runner.ts
+index 71c5038..c21acea 100644
+--- a/src/container-runner.ts
++++ b/src/container-runner.ts
+@@ -1,3 +1,5 @@
++import { workspaceModelContribution } from './modules/workspace-ui/model-provider.js';
++import { selectedSkillNames } from './runtime-skills.js';
+ /**
+  * Container Runner v2
+  *
+@@ -50,7 +52,6 @@ import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './dr
+ import {
+   gatewayRuntimeIdentity,
+   getGatewayProvider,
+-  selectGatewayAgentSkills,
+   type GatewayContribution,
+   type GatewaySessionInput,
+   type GatewaySessionLease,
+@@ -60,6 +61,7 @@ import { initGroupFilesystem } from './group-init.js';
+ import { getAgentMailbox } from './mailbox/index.js';
+ import { stopTypingRefresh } from './modules/typing/index.js';
+ import { log } from './log.js';
++import { sessionWorkspaceConfiguration } from './session-workspace.js';
+ import { validateAdditionalMounts } from './modules/mount-security/index.js';
+ // Provider contracts use a separate barrel so update-skills identity detection
+ // remains tied to src/providers/index.ts.
+@@ -207,6 +209,27 @@ async function releaseClaimQuietly(sessionId: string, incarnation: number): Prom
+  */
+ const wakePromises = new Map<string, Promise<boolean>>();
+ 
++const agentConfigurationPauses = new Map<string, Map<string, Session>>();
++/** Block new spawns while an idle configuration handoff commits. Mail stays in its inbox. */
++export function beginAgentConfiguration(agentId: string) {
++  if (agentConfigurationPauses.has(agentId)) return undefined;
++  const deferred = new Map<string, Session>();
++  agentConfigurationPauses.set(agentId, deferred);
++  let released = false;
++  return {
++    async settle(sessionIds: string[]) { await Promise.all(sessionIds.map(id => wakePromises.get(id))); },
++    release() {
++      if (released) return;
++      released = true;
++      agentConfigurationPauses.delete(agentId);
++      for (const session of deferred.values()) void getSession(session.id).then(current => {
++        if (current?.status === 'active') return wakeContainer(current);
++      }).catch(err => log.warn('Deferred configuration wake failed; sweep will retry', {sessionId:session.id,err}));
++    },
++  };
++}
++
++
+ /**
+  * Sweep-run deferred-adoption retries in flight, keyed by session id (see
+  * `retryPendingAdoptions`). Resolves false when the retry failed.
+@@ -388,6 +411,12 @@ async function retryPendingAdoption(sessionId: string): Promise<boolean> {
+  * next tick.
+  */
+ export function wakeContainer(session: Session): Promise<boolean> {
++  const configurationPause = agentConfigurationPauses.get(session.agent_group_id);
++  if (configurationPause) {
++    configurationPause.set(session.id, session);
++    return Promise.resolve(false);
++  }
++
+   // The sweep is re-fencing this session's survivor (checked first: it may be
+   // registered and mid-stop). Once it settles cleanly, wake again from a fresh
+   // read, so a container it stopped or found gone is replaced now, not a tick
+@@ -457,7 +486,10 @@ async function spawnContainer(session: Session): Promise<void> {
+   // Materialize container.json from DB — writes fresh file and returns
+   // the config object, threaded through provider resolution, buildMounts,
+   // and buildContainerArgs so we don't re-read.
+-  const containerConfig = await materializeContainerJson(agentGroup.id);
++  const containerConfig = await sessionWorkspaceConfiguration(session, await materializeContainerJson(agentGroup.id));
++  const sessionConfigPath = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.context', `${session.id}.container.json`);
++  fs.mkdirSync(path.dirname(sessionConfigPath), { recursive: true, mode: 0o700 });
++  fs.writeFileSync(sessionConfigPath, JSON.stringify(containerConfig), { mode: 0o600 });
+ 
+   const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
+   await initGroupFilesystem(agentGroup, { provider: providerName });
+@@ -468,10 +500,10 @@ async function spawnContainer(session: Session): Promise<void> {
+   const { provider, contribution, surfaces } = await resolveProviderContribution(session, agentGroup, containerConfig);
+ 
+   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
++  const driver = getSessionDriver();
+   const mounts = await buildMounts(agentGroup, session, containerConfig, provider, contribution, surfaces);
+   const mailboxEnvironment = await mailbox.runnerEnvironment(mailboxKey);
+ 
+-  const driver = getSessionDriver();
+   // Core calls the same idempotent provider operation for new and surviving
+   // sessions. The returned typed contribution enters driver validation whole.
+   const gatewaySession = await ensureGatewaySession({
+@@ -501,7 +533,7 @@ async function spawnContainer(session: Session): Promise<void> {
+       );
+     }
+ 
+-    spec = composeSessionSpec({
++    const composition = {
+       agentGroup,
+       session,
+       containerName,
+@@ -510,7 +542,8 @@ async function spawnContainer(session: Session): Promise<void> {
+       contribution,
+       gateway,
+       mailboxEnvironment,
+-    });
++    };
++    spec = composeSessionSpec(composition);
+ 
+     log.info('Spawning session', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
+ 
+@@ -1134,7 +1167,7 @@ export async function resolveProviderContribution(
+     selectedSkills: selectedSkillNames(containerConfig),
+     hostEnv: process.env,
+   };
+-  if (!contract) return { provider, contribution: fn ? await fn(context) : {} };
++  if (!contract) return { provider, contribution: await workspaceModelContribution(provider, containerConfig.model, fn ? await fn(context) : {}) };
+   if (contract.legacyHostAdapter === 'required' && !fn) {
+     throw new Error(`Provider '${provider}' host contract requires a legacy host adapter`);
+   }
+@@ -1147,7 +1180,7 @@ export async function resolveProviderContribution(
+     context.sessionDir,
+     context.selectedSkills,
+     {
+-      legacyOverlay: () => Promise.resolve(fn?.({ ...context, coreOwnsProviderSurfaces: true as const }) ?? {}),
++      legacyOverlay: async () => workspaceModelContribution(provider, containerConfig.model, await fn?.({ ...context, coreOwnsProviderSurfaces: true as const }) ?? {}),
+       composeProjectDocument: (spec) => composeGroupProjectDoc(agentGroup, context.groupDir, spec),
+     },
+   );
+@@ -1226,7 +1259,8 @@ export async function buildMounts(
+   // read its config but cannot modify it. Composed per group, so 'group-state'
+   // read-only rather than 'install-surface': the install-surface rule is an
+   // enumerated release-surface allowlist, and this path is under the group.
+-  const containerJsonPath = path.join(groupDir, 'container.json');
++  const sessionConfigPath = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.context', `${session.id}.container.json`);
++  const containerJsonPath = fs.existsSync(sessionConfigPath) ? sessionConfigPath : path.join(groupDir, 'container.json');
+   if (fs.existsSync(containerJsonPath)) {
+     mounts.push({
+       hostPath: containerJsonPath,
+@@ -1569,24 +1603,6 @@ export function syncSkillSymlinks(
+   return selected;
+ }
+ 
+-/**
+- * Resolve the group's skill selection to concrete names — `'all'` recomputes
+- * from `container/skills/` so newly-added upstream skills appear automatically.
+- */
+-function selectedSkillNames(containerConfig: import('./container-config.js').ContainerConfig): string[] {
+-  const sharedSkillsDir = path.join(process.cwd(), 'container', 'skills');
+-  const available = fs.existsSync(sharedSkillsDir)
+-    ? fs.readdirSync(sharedSkillsDir).filter((e) => {
+-        try {
+-          return fs.statSync(path.join(sharedSkillsDir, e)).isDirectory();
+-        } catch {
+-          return false;
+-        }
+-      })
+-    : [];
+-  const selected = containerConfig.skills === 'all' ? available : containerConfig.skills;
+-  return selectGatewayAgentSkills(selected);
+-}
+ 
+ const execAsync = promisify(exec);
+ 
+diff --git a/src/delivery.ts b/src/delivery.ts
+index 9a41dab..d423a7b 100644
+--- a/src/delivery.ts
++++ b/src/delivery.ts
+@@ -286,7 +286,7 @@ async function drainSession(session: Session): Promise<void> {
+   for (const hook of batchPreviewHooks) {
+     try {
+       await hook(
+-        pending.map(({ kind, content }) => ({ kind, content })),
++        pending.map(({ id, kind, content }) => ({ id, kind, content })),
+         session,
+       );
+     } catch (err) {
+@@ -629,7 +629,7 @@ function isUnguardedEntry(entry: DeliveryEntry): entry is Extract<DeliveryEntry,
+ 
+ /** See the batch-preview invocation in the delivery poll for semantics. */
+ type DeliveryBatchPreviewHook = (
+-  batch: Array<{ kind: string; content: string }>,
++  batch: Array<{ id: string; kind: string; content: string }>,
+   session: Session,
+ ) => void | Promise<void>;
+ const batchPreviewHooks: DeliveryBatchPreviewHook[] = [];
+diff --git a/src/drivers/docker-driver.test.ts b/src/drivers/docker-driver.test.ts
+index 7e578a6..9a193be 100644
+--- a/src/drivers/docker-driver.test.ts
++++ b/src/drivers/docker-driver.test.ts
+@@ -815,3 +815,20 @@ it('does not report successful teardown when the Docker daemon refuses removal',
+   cli.responses.unshift({ match: /^(stop|rm|ps) /, throws: new Error('Cannot connect to the Docker daemon') });
+   await expect(handle.stop('shutdown')).rejects.toMatchObject({ kind: 'runtime-unavailable' });
+ });
++
++it('waits for asynchronous auto-removal before confirming a successful stop',async()=>{
++ const handle=await driver().prepare(fixtureSpec());const run=cli.run.bind(cli);let probes=0;
++ vi.spyOn(cli,'run').mockImplementation((args,opts)=>{
++  if(args[0]==='rm')throw Error('removal already in progress');
++  if(args[0]==='ps')return ++probes<3?'ncl-spike-s1\n':'';
++  return run(args,opts);
++ });
++ await expect(handle.stop('configuration-change')).resolves.toBeUndefined();expect(probes).toBe(3);
++});
++it('bounds a removal check without declaring a still-present runtime stopped',async()=>{
++ const handle=await driver().prepare(fixtureSpec());const run=cli.run.bind(cli);
++ vi.spyOn(cli,'run').mockImplementation((args,opts)=>{
++  if(args[0]==='rm')throw Error('removal refused');if(args[0]==='ps')return 'ncl-spike-s1\n';return run(args,opts);
++ });
++ vi.useFakeTimers();try{const outcome=expect(handle.stop('configuration-change')).rejects.toMatchObject({kind:'unknown'});await vi.advanceTimersByTimeAsync(2100);await outcome;}finally{vi.useRealTimers();}
++});
+diff --git a/src/drivers/docker-driver.ts b/src/drivers/docker-driver.ts
+index b0f66a1..66b066b 100644
+--- a/src/drivers/docker-driver.ts
++++ b/src/drivers/docker-driver.ts
+@@ -609,7 +609,7 @@ class DockerHandle implements SessionHandle {
+     try {
+       this.cli.run(['rm', '--force', this.name]);
+     } catch (error) {
+-      this.#confirmRemoved(this.name, error);
++      await this.#confirmRemoved(this.name, error);
+     }
+     for (const auxiliary of [...this.auxiliaryNames].reverse()) {
+       try {
+@@ -620,7 +620,7 @@ class DockerHandle implements SessionHandle {
+       try {
+         this.cli.run(['rm', '--force', auxiliary]);
+       } catch (error) {
+-        this.#confirmRemoved(auxiliary, error);
++        await this.#confirmRemoved(auxiliary, error);
+       }
+     }
+     if (this.privateNetwork) {
+@@ -633,13 +633,20 @@ class DockerHandle implements SessionHandle {
+   }
+ 
+   /** A successful daemon query distinguishes auto-removal from a daemon outage. */
+-  #confirmRemoved(name: string, error: unknown): void {
+-    try {
+-      const remaining = this.cli.run(['ps', '-a', '--filter', `name=^/${name}$`, '--format', '{{.Names}}']);
+-      if (!remaining.trim()) return;
+-    } catch (probeError) {
+-      throw normalizeDockerError(probeError);
+-    }
++  async #confirmRemoved(name: string, error: unknown): Promise<void> {
++    // --rm cleanup can still be in progress after stop returns. A refused
++    // second removal is not a teardown failure until the daemon keeps listing it.
++    const deadline = Date.now() + 2_000;
++    do {
++      try {
++        const remaining = this.cli.run(['ps', '-a', '--filter', `name=^/${name}$`, '--format', '{{.Names}}']);
++        if (!remaining.trim()) return;
++      } catch (probeError) {
++        throw normalizeDockerError(probeError);
++      }
++      if (Date.now() >= deadline) break;
++      await new Promise(resolve => setTimeout(resolve, 50));
++    } while (Date.now() <= deadline);
+     throw normalizeDockerError(error);
+   }
+ 
+@@ -716,7 +723,7 @@ export function dockerEventToSessionEvent(doc: unknown, installSlug: string): Se
+ export function agentContainerName(spec: Pick<SessionSpec, 'key'>): string {
+   const raw = `${spec.key.installSlug}-${spec.key.sessionId}`.replaceAll(/[^a-zA-Z0-9_.-]/g, '-');
+   if (raw.length <= 48) return `ncl-${raw}`;
+-  const hash = createHash('sha256').update(`${spec.key.installSlug} ${spec.key.sessionId}`).digest('hex').slice(0, 8);
++  const hash = createHash('sha256').update(`${spec.key.installSlug}\u0000${spec.key.sessionId}`).digest('hex').slice(0, 8);
+   return `ncl-${raw.slice(0, 39)}-${hash}`;
+ }
+ 
+diff --git a/src/gateway-approval-coordinator.ts b/src/gateway-approval-coordinator.ts
+index 5050d8b..9d1dfda 100644
+--- a/src/gateway-approval-coordinator.ts
++++ b/src/gateway-approval-coordinator.ts
+@@ -1,3 +1,4 @@
++import { isOperatorResponse } from './response-registry.js';
+ import { gatewayApprovalPresentation } from './gateway-approval-presentation.js';
+ import { permitsConfiguredGatewayRead, permitsUncredentialedGatewayRead } from './gateway-read-policy.js';
+ import { getContainerConfig } from './db/container-configs.js';
+@@ -547,7 +548,7 @@ export async function handleGatewayApprovalResponse(payload: ResponsePayload): P
+     state = pending.get(payload.questionId);
+     if (!(await isAuthorizedApprovalClick(approval, payload))) return true;
+     if (
+-      approvalSource?.durable &&
++      !isOperatorResponse(payload) && approvalSource?.durable &&
+       (payload.instance !== (approval.instance ?? approval.channel_type) ||
+         payload.channelType !== approval.channel_type ||
+         (payload.messageId !== undefined && payload.messageId !== approval.platform_message_id) ||
+diff --git a/src/mailbox/sqlite/index.ts b/src/mailbox/sqlite/index.ts
+index 5810720..8c81592 100644
+--- a/src/mailbox/sqlite/index.ts
++++ b/src/mailbox/sqlite/index.ts
+@@ -174,6 +174,10 @@ function getTaskStats(db: Database.Database, seriesId: string): TaskStats {
+ 
+ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => nextEvenAcross(db)): InboundMailbox {
+   return {
++    getWorkspaceMessage: (id) => db.prepare('SELECT id,seq,timestamp,kind,content,channel_type,status FROM messages_in WHERE id=?').get(id) as import('../types.js').WorkspaceMailboxMessage | undefined,
++    setWorkspaceContext: (value) => db.prepare('INSERT INTO workspace_context (id,value) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value').run(value),
++    setWorkspaceControl: (control) => db.prepare("INSERT INTO workspace_context (id,value,control) VALUES (1,'{}',?) ON CONFLICT(id) DO UPDATE SET control=excluded.control").run(control),
++    getWorkspaceInbound: (after, limit) => db.prepare('SELECT id,seq,timestamp,kind,content,channel_type,status FROM messages_in WHERE seq>? ORDER BY seq LIMIT ?').all(after, limit) as import('../types.js').WorkspaceMailboxMessage[],
+     setRouting: (routing) => {
+       const record = parseSessionRoutingRecord(routing);
+       upsertSessionRouting(db, {
+@@ -311,6 +315,13 @@ export function wrapSqliteOutbound(
+ ): OutboundMailbox {
+   const readable = () => (typeof source === 'function' ? source() : source);
+   return {
++    getWorkspaceState: (key) => (readable().prepare('SELECT value FROM session_state WHERE key=?').get(key) as { value: string } | undefined)?.value ?? null,
++    getWorkspaceOutbound: (after, limit) => readable().prepare('SELECT id,seq,timestamp,kind,content,channel_type FROM messages_out WHERE seq>? ORDER BY seq LIMIT ?').all(after, limit) as import('../types.js').WorkspaceMailboxMessage[],
++    getWorkspaceEvents: (after, limit) => {
++      const db = readable();
++      if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='workspace_events' AND type='table'").get()) return [];
++      return db.prepare('SELECT seq,timestamp,kind,content FROM workspace_events WHERE seq>? ORDER BY seq LIMIT ?').all(after, limit) as import('../types.js').WorkspaceMailboxEvent[];
++    },
+     getTerminalProcessingAcks: () =>
+       (
+         readable()
+@@ -471,6 +482,7 @@ export class SqliteAgentMailbox implements AgentMailbox {
+     try {
+       if (!this.migrated.has(inboundPath)) {
+         migrateMessagesInTable(inbound);
++        inbound.exec('CREATE TABLE IF NOT EXISTS workspace_context (id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL,control TEXT)');
+         const deliveredColumns = inbound.prepare("PRAGMA table_info('delivered')").all();
+         if (deliveredColumns.length > 0) migrateDeliveredTable(inbound);
+         this.migrated.add(inboundPath);
+diff --git a/src/mailbox/sqlite/schema.ts b/src/mailbox/sqlite/schema.ts
+index dbbb999..a090ef0 100644
+--- a/src/mailbox/sqlite/schema.ts
++++ b/src/mailbox/sqlite/schema.ts
+@@ -1,5 +1,6 @@
+ /** Host-owned SQLite mailbox schema. */
+ export const INBOUND_SCHEMA = `
++CREATE TABLE IF NOT EXISTS workspace_context (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL, control TEXT);
+ CREATE TABLE IF NOT EXISTS messages_in (
+   id             TEXT PRIMARY KEY,
+   seq            INTEGER UNIQUE,
+@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS session_routing (
+ 
+ /** Runner-owned SQLite mailbox schema. */
+ export const OUTBOUND_SCHEMA = `
++CREATE TABLE IF NOT EXISTS workspace_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS messages_out (
+   id             TEXT PRIMARY KEY,
+   seq            INTEGER UNIQUE,
+diff --git a/src/mailbox/types.ts b/src/mailbox/types.ts
+index dbb546b..b7a38c4 100644
+--- a/src/mailbox/types.ts
++++ b/src/mailbox/types.ts
+@@ -90,7 +90,14 @@ export interface MailboxTimelineMessage {
+ }
+ 
+ /** Host-visible inbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
++export interface WorkspaceMailboxMessage { id: string; seq: number; timestamp: string; kind: string; content: string; channel_type: string | null; status?: string; }
++export interface WorkspaceMailboxEvent { seq: number; timestamp: string; kind: string; content: string; }
++
+ export interface InboundMailbox {
++  getWorkspaceMessage?(id: string): WorkspaceMailboxMessage | undefined;
++  setWorkspaceContext?(context: string): void;
++  setWorkspaceControl?(control: string): void;
++  getWorkspaceInbound?(after: number, limit: number): WorkspaceMailboxMessage[];
+   setRouting(routing: SessionRouting): void;
+   replaceDestinations(entries: Destination[]): void;
+   insertMessage(message: InboundMessage): Promise<void>;
+@@ -136,6 +143,9 @@ export interface InboundMailbox {
+ 
+ /** Host-visible outbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
+ export interface OutboundMailbox {
++  getWorkspaceOutbound?(after: number, limit: number): WorkspaceMailboxMessage[];
++  getWorkspaceEvents?(after: number, limit: number): WorkspaceMailboxEvent[];
++  getWorkspaceState?(key: string): string | null;
+   getTerminalProcessingAcks(): ProcessingAck[];
+   getProcessingClaims(): ProcessingClaim[];
+   deleteOrphanProcessingClaims(): number;
+diff --git a/src/modules/community-portal/registration.test.ts b/src/modules/community-portal/registration.test.ts
+index 2de19b4..33ac466 100644
+--- a/src/modules/community-portal/registration.test.ts
++++ b/src/modules/community-portal/registration.test.ts
+@@ -17,8 +17,13 @@ it('the real modules barrel registers the portal connection with host start and
+   await import('../index.js');
+   expect(runtime.start).not.toHaveBeenCalled();
+   const signal = new AbortController().signal;
+-  await lifecycle.getHostStartCallbacks().at(-1)!({ signal, db: {} as never, deliveryAdapter: {} as never });
++  const { initTestDb, closeDb } = await import('../../db/connection.js');
++  const db = await initTestDb();
++  const { runMigrations } = await import('../../db/migrations/index.js');
++  await runMigrations(db);
++  await lifecycle.startHostModules({ signal, db, deliveryAdapter: {} as never });
+   expect(runtime.start).toHaveBeenCalledWith({ signal, log: expect.any(Function) });
+-  await lifecycle.getHostShutdownCallbacks().at(-1)!();
++  await lifecycle.stopHostModules();
++  await closeDb();
+   expect(runtime.stop).toHaveBeenCalledOnce();
+ });
+diff --git a/src/modules/index.ts b/src/modules/index.ts
+index f88885c..97375ca 100644
+--- a/src/modules/index.ts
++++ b/src/modules/index.ts
+@@ -25,3 +25,7 @@ import './permissions/index.js';
+ import './agent-to-agent/index.js';
+ import './self-mod/index.js';
+ import './community-portal/index.js';
++
++import './workspace-ui/index.js';
++
++
+diff --git a/src/modules/interactive/index.ts b/src/modules/interactive/index.ts
+index 8dacfa6..e807a5f 100644
+--- a/src/modules/interactive/index.ts
++++ b/src/modules/interactive/index.ts
+@@ -31,7 +31,7 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<bool
+   }
+ 
+   await writeSessionMessage(session.agent_group_id, session.id, {
+-    id: `qr-${payload.questionId}-${Date.now()}`,
++    id: `qr-${payload.questionId}`,
+     kind: 'system',
+     timestamp: new Date().toISOString(),
+     platformId: pq.platform_id,
+diff --git a/src/modules/mount-security/index.ts b/src/modules/mount-security/index.ts
+index 3549d76..1aa0e72 100644
+--- a/src/modules/mount-security/index.ts
++++ b/src/modules/mount-security/index.ts
+@@ -309,6 +309,14 @@ export interface MountValidationResult {
+  * Validate a single additional mount against the allowlist.
+  * Returns validation result with reason.
+  */
++/** Inspect a proposed root before an operator grants it in the allowlist. */
++export function inspectMountCandidate(hostPath: string): { realPath: string; blocked: string | null } {
++  const realPath = fs.realpathSync(expandPath(hostPath));
++  if (!fs.statSync(realPath).isDirectory()) throw new Error('Mount root must be a directory.');
++  const patterns = loadMountAllowlist()?.blockedPatterns ?? DEFAULT_BLOCKED_PATTERNS;
++  return { realPath, blocked: matchesBlockedPattern(realPath, patterns) };
++}
++
+ export function validateMount(mount: AdditionalMount): MountValidationResult {
+   const allowlist = loadMountAllowlist();
+ 
+diff --git a/src/response-registry.ts b/src/response-registry.ts
+index 51fbd58..fe064b3 100644
+--- a/src/response-registry.ts
++++ b/src/response-registry.ts
+@@ -35,3 +35,11 @@ export function registerResponseHandler(handler: ResponseHandler, options: { pre
+ export function getResponseHandlers(): readonly ResponseHandler[] {
+   return responseHandlers;
+ }
++
++const operatorResponses = new WeakSet<ResponsePayload>();
++/** Only owner-authenticated host transports mint this proof; JSON cannot forge it. */
++export function markOperatorResponse(payload: ResponsePayload): ResponsePayload {
++  operatorResponses.add(payload);
++  return payload;
++}
++export function isOperatorResponse(payload: ResponsePayload): boolean { return operatorResponses.has(payload); }
+diff --git a/src/router.ts b/src/router.ts
+index 35fc116..c8f147a 100644
+--- a/src/router.ts
++++ b/src/router.ts
+@@ -19,6 +19,9 @@
+  */
+ import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
+ import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
++import { isOwner } from './modules/permissions/db/user-roles.js';
++import { getMessagingGroup } from './db/messaging-groups.js';
++import { withExistingMailboxSession } from './session-manager.js';
+ import { gateCommand } from './command-gate.js';
+ import { getDeliveryAdapter } from './delivery.js';
+ import { getAgentGroup } from './db/agent-groups.js';
+@@ -691,3 +694,28 @@ function messageIdForAgent(baseId: string | undefined, agentGroupId: string): st
+   const id = baseId && baseId.length > 0 ? baseId : generateId();
+   return `${id}:${agentGroupId}`;
+ }
++
++/** Owner-authenticated transports target one existing session without channel fan-out. */
++export async function routeOperatorMessage(sessionId: string, ownerId: string, message: {
++  id: string; content: string; timestamp: string;
++}): Promise<{ queued: boolean; duplicate: boolean }> {
++  if (!(await isOwner(ownerId))) throw new Error('Owner access is required.');
++  const session = await getSession(sessionId);
++  if (!session || session.status !== 'active') throw new Error('Session is not active.');
++  const gate = await gateCommand(message.content, ownerId, session.agent_group_id);
++  if (gate.action !== 'pass') throw new Error(gate.action === 'filter' ? 'This command is unavailable.' : 'Command access denied.');
++  const existing = await withExistingMailboxSession(session.agent_group_id, session.id, (box) => box.getWorkspaceMessage?.(message.id));
++  if (existing) {
++    const original = JSON.parse(existing.content);
++    const request = JSON.parse(message.content);
++    if (original._workspaceRequestDigest !== request._workspaceRequestDigest) throw new Error('This message id was already used for a different message.');
++    return { queued: true, duplicate: true };
++  }
++  const mg = session.messaging_group_id ? await getMessagingGroup(session.messaging_group_id) : undefined;
++  if (!mg) throw new Error('This session has no conversation destination.');
++  await writeSessionMessage(session.agent_group_id, session.id, {
++    ...message, kind: 'chat', channelType: mg.channel_type, platformId: mg.platform_id, threadId: session.thread_id,
++  });
++  const queued = !(await requestWake(session, 'inbound-message'));
++  return { queued, duplicate: false };
++}
+diff --git a/src/session-manager.ts b/src/session-manager.ts
+index ad84b64..b9fb29d 100644
+--- a/src/session-manager.ts
++++ b/src/session-manager.ts
+@@ -6,6 +6,7 @@ import { AsyncLocalStorage } from 'async_hooks';
+ import fs from 'fs';
+ import path from 'path';
+ 
++import { sessionWorkspaceContext } from './session-workspace.js';
+ import { AnchoredDir } from './anchored-dir.js';
+ import { deriveAttachmentName } from './attachment-naming.js';
+ import { inboxFolderName, isSafeAttachmentName } from './attachment-safety.js';
+@@ -311,8 +312,11 @@ export async function writeSessionMessage(
+ 
+   // Extract base64 attachment data, save to inbox, replace with file paths
+   const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
++  const workspaceContext = await sessionWorkspaceContext(sessionId);
+ 
++  // Lock the runtime before mail becomes visible to any runner or sweep.
+   await withMailboxSession(agentGroupId, sessionId, async (mailbox) => {
++    if (workspaceContext !== undefined) mailbox.setWorkspaceContext?.(workspaceContext);
+     await mailbox.insertMessage({
+       id: message.id,
+       kind: message.kind,
+@@ -328,6 +332,8 @@ export async function writeSessionMessage(
+       onWake: message.onWake ?? false,
+     });
+   });
++  // Preserve the completion stamp after mail lands (the target may be deleted
++  // while insertion is in flight; routing rechecks that lifecycle boundary).
+   await updateSession(sessionId, { last_active: new Date().toISOString() });
+   // Ask for a prompt reconcile now that the message is durable: a wake that
+   // fails transiently is retried within the queue's cadence instead of
+diff --git a/vitest.config.ts b/vitest.config.ts
+index 2f8eea8..99cdada 100644
+--- a/vitest.config.ts
++++ b/vitest.config.ts
+@@ -9,6 +9,7 @@ export default defineConfig({
+     // under Bun (they depend on bun:sqlite) and must not be picked up here.
+     include: [
+       'src/**/*.test.ts',
++      'web/workspace/tests/**/*.test.ts',
+       'setup/**/*.test.ts',
+       'scripts/**/*.test.ts',
+       'container/*.test.ts',

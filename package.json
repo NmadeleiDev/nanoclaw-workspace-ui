@@ -1,0 +1,14 @@
+{
+  "name": "nanoclaw-workspace-ui-addon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Docker-only project/session web UI source add-on for NanoClaw v2",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "check": "node release.mjs --check",
+    "test": "node --test tests/*.test.mjs",
+    "pack:release": "node release.mjs --build"
+  }
+}

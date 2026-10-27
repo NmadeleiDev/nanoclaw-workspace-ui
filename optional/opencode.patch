@@ -1,0 +1,76 @@
+diff --git a/container/agent-runner/src/providers/opencode-config.ts b/container/agent-runner/src/providers/opencode-config.ts
+index 9d9f0e6..2d2307a 100644
+--- a/container/agent-runner/src/providers/opencode-config.ts
++++ b/container/agent-runner/src/providers/opencode-config.ts
+@@ -115,7 +115,7 @@ export function resolveOpenCodeInference(
+       // (e.g. `openrouter`, set alongside ANTHROPIC_BASE_URL per the
+       // documented OpenRouter config) ship their own native ai-sdk
+       // package and must keep OpenCode's default transport resolution.
+-      ...(provider === 'openai' && proxyUrl ? { npm: '@ai-sdk/openai-compatible' } : {}),
++      ...(environment.OPENCODE_API_TYPE ? { npm: ({ 'openai-compatible': '@ai-sdk/openai-compatible', 'openai-responses': '@ai-sdk/openai', anthropic: '@ai-sdk/anthropic' } as Record<string, string>)[environment.OPENCODE_API_TYPE] } : provider === 'openai' && proxyUrl ? { npm: '@ai-sdk/openai-compatible' } : {}),
+       options: { apiKey: OPENCODE_CREDENTIAL_PLACEHOLDER, ...(proxyUrl ? { baseURL: proxyUrl } : {}) },
+       ...(modelsToRegister.length > 0
+         ? {
+@@ -204,8 +204,8 @@ export function buildOpenCodeConfig(
+   >;
+   return {
+     ...inference,
+-    permission: configuration ? configuration.executionPolicy : resolveOpenCodeExecutionPolicy(),
+-    mcp: configuration ? configuration.mcpServers : mcpServersToOpenCodeConfig(options.mcpServers),
++    permission: options.utilityMode ? { '*': 'deny' } : configuration ? configuration.executionPolicy : resolveOpenCodeExecutionPolicy(),
++    mcp: options.utilityMode ? {} : configuration ? configuration.mcpServers : mcpServersToOpenCodeConfig(options.mcpServers),
+     autoupdate: false,
+     snapshot: false,
+     // Core's human-question tool waits up to five minutes. This request budget
+@@ -213,6 +213,6 @@ export function buildOpenCodeConfig(
+     experimental: { mcp_timeout: 330_000 },
+     // The runner renders this file once per turn. Native steps, compaction
+     // continuation and Task children reread it through the instructions pipeline.
+-    instructions: [`${AGENT_DIR}/CLAUDE.md`, `${AGENT_DIR}/CLAUDE.local.md`, openCodeInstructionsPath()],
++    instructions: options.utilityMode ? [] : [`${AGENT_DIR}/CLAUDE.md`, `${AGENT_DIR}/CLAUDE.local.md`, openCodeInstructionsPath()],
+   };
+ }
+diff --git a/container/agent-runner/src/providers/opencode-turn.ts b/container/agent-runner/src/providers/opencode-turn.ts
+index 1eb201e..45a9594 100644
+--- a/container/agent-runner/src/providers/opencode-turn.ts
++++ b/container/agent-runner/src/providers/opencode-turn.ts
+@@ -32,7 +32,7 @@ export interface OpenCodeSessionClient {
+   create(params?: { signal?: AbortSignal }): Promise<{ data?: { id?: string }; error?: unknown }>;
+   prompt(params: {
+     path: { id: string };
+-    body: { messageID: string; parts: unknown[]; model?: OpenCodePromptModel };
++    body: { messageID: string; parts: unknown[]; model?: OpenCodePromptModel; system?: string };
+     signal?: AbortSignal;
+   }): Promise<{ data?: OpenCodeMessage; error?: unknown }>;
+   messages(params: {
+@@ -172,6 +172,7 @@ export async function* executeOpenCodeTurn(options: {
+   parts: unknown[];
+   /** Sent with every prompt: a resumed session otherwise keeps the model it was created with. */
+   model?: OpenCodePromptModel;
++  system?: string;
+   signal: AbortSignal;
+   silenceMs: number;
+   idleMs: number;
+@@ -238,7 +239,7 @@ export async function* executeOpenCodeTurn(options: {
+     started = true;
+     promptRequest = client.prompt({
+       path: { id: sessionId },
+-      body: { messageID: messageId, parts: options.parts, ...(options.model ? { model: options.model } : {}) },
++      body: { messageID: messageId, parts: options.parts, ...(options.system ? { system: options.system } : {}), ...(options.model ? { model: options.model } : {}) },
+       signal: request.signal,
+     });
+     void promptRequest.then(
+diff --git a/container/agent-runner/src/providers/opencode.ts b/container/agent-runner/src/providers/opencode.ts
+index 7f849c7..4ea4a39 100644
+--- a/container/agent-runner/src/providers/opencode.ts
++++ b/container/agent-runner/src/providers/opencode.ts
+@@ -611,7 +611,9 @@ export class OpenCodeProvider implements AgentProvider {
+             sessionId,
+             parts: [{ type: 'text', text: turn }],
+             model: promptModel,
++            system: input.utility ? input.systemContext?.instructions : undefined,
+             prepare: async () => {
++              if (input.utility) return;
+               await prepareOpenCodeMemory(
+                 self.memorySessionHook!,
+                 input.systemContext?.instructions,

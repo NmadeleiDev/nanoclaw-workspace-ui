@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "upstreamRepository": "https://github.com/nanocoai/nanoclaw",
+  "upstreamCommit": "acc2b1c8f52a954368cfaf04b61c32f9a1efc280",
+  "runtime": "docker",
+  "node": ">=22.18",
+  "optionalProvider": "upstream add-opencode payload at the same commit"
+}
