@@ -3605,7 +3605,7 @@ function App() {
                           label="Stop current turn"
                           onClick={() =>
                             void api(`/sessions/${sessionId}/cancel`, 'POST', {})
-                              .then(() => notify('Stop requested.'))
+                              .then((result: any) => notify(result.requested ? 'Stop requested.' : 'Nothing is running; activity refreshed.'))
                               .catch((e) => notify(String(e)))
                           }
                         />

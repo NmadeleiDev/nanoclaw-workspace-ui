@@ -387,3 +387,8 @@ Working text and Markdown documents have Edit and Save (Cmd/Ctrl+S). Attachments
 Agents use `workspace_viewer` with operation `open` and `path` or `attachmentId`, then `focus`/`refresh` with the returned `documentId`. `list` returns registered documents. The tool requests presentation in this conversation and does not confirm receipt by a user. Agents cannot close tabs or discard edits. Working files must be in the agent workspace or an explicitly accessible mounted folder. Hidden and runtime/credential files are excluded. Live saves are disabled in isolated previews.
 
 Select a passage in a document preview and choose **Quote** (or Alt/Option+Q) to append it to the message draft. Quotes appear as styled blocks in the composer, with a source label and an individual remove button; type your reply below them. They are saved separately from reply text for this conversation in this browser. The text sent to the agent identifies the document name, working path or attachment ID, document ID and revision; PDF quotes also include the page. Unsaved preview edits are labeled as an unsaved draft. Nothing is sent automatically. Existing draft text stays intact. On small screens or in an expanded viewer, quoting returns to the composer while preserving document tabs. Read-only attachments support quoting.
+
+
+### Runner replacement and Stop
+
+An unfinished turn becomes **Interrupted** when its runner is replaced, including when the replacement is already idle or working. Retained output stays in history. Stop requests cancellation of an active turn; when the session is idle it refreshes activity and reports that nothing is running. A request acknowledgement is not proof that a command has terminated.

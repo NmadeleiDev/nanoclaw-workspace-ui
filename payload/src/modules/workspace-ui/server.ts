@@ -378,7 +378,11 @@ export async function startWorkspaceServer(
       match = /^\/api\/sessions\/([^/]+)\/cancel$/.exec(route);
       if (match && method === 'POST') {
         if (!service.bridge) throw new WorkspaceError(503, 'This is an isolated preview.');
-        await service.bridge.cancel(await service.store.getSession(match[1]));
+        const session = await service.store.getSession(match[1]);
+        await service.collect(session);
+        const live = await service.live(session.id);
+        if (!live?.running && !live?.waiting) return json({ requested: false, status: 'idle' });
+        await service.bridge.cancel(session);
         return json({ requested: true });
       }
       match = /^\/api\/documents\/(session|project)\/([^/]+)(\/revisions)?$/.exec(route);

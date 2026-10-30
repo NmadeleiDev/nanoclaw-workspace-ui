@@ -1,6 +1,16 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import { getAgentMailbox } from './mailbox/index.js';
 import { touchHeartbeat } from './heartbeat.js';
+
+let runtimeRunId: string | undefined;
+/** Process identity survives host adoption, but never a runner replacement. */
+export function initializeWorkspaceRun(): void {
+  runtimeRunId = randomUUID();
+  const operations = getAgentMailbox().operations;
+  operations.setState('ws.runtime-run-id', runtimeRunId);
+  operations.writeWorkspaceEvent?.('runtime-start', JSON.stringify({ runtimeRunId }));
+}
 
 /** These records are supplied by the host, rather than shared group documents. */
 export function readWorkspaceContext(): Record<string, any> | null {
@@ -48,6 +58,7 @@ function redact(value: unknown, key = '', depth = 0): unknown {
 }
 
 export function emitWorkspaceEvent(kind: string, data: Record<string, unknown>): void {
+  data = { ...data, ...(runtimeRunId ? { runtimeRunId } : {}) };
   if (!readWorkspaceContext()) return;
   const write = getAgentMailbox().operations.writeWorkspaceEvent;
   if (!write) return;

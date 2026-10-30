@@ -532,3 +532,12 @@ it('serves a completed turn summary while the next turn is running',async()=>{
  expect(detail.live.running).toBe(true);
  expect(detail.activitySummaries['live:2026-10-29T14:58:15.000Z:tools:read']).toMatchObject({state:'completed',text:'Read the requested file.'});
 });
+
+
+it('reports idle cancellation honestly without dispatching an abort', async () => {
+ await store.db.run('INSERT INTO agent_groups(id,name,folder,created_at) VALUES(?,?,?,?)','cancel-fixture','Fixture','cancel-fixture',new Date().toISOString());
+ await store.addSession({id:'idle-cancel',agentId:'cancel-fixture'});
+ const cancel=vi.fn();Object.defineProperty(service,'bridge',{value:{cancel}});
+ const response=await fetch(`${base}/api/sessions/idle-cancel/cancel`,{method:'POST',headers:{Cookie:cookie,'X-Workspace-Csrf':csrf,'Content-Type':'application/json'},body:'{}'});
+ expect(response.status).toBe(200);expect(await response.json()).toEqual({requested:false,status:'idle'});expect(cancel).not.toHaveBeenCalled();
+});

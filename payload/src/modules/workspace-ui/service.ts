@@ -523,6 +523,7 @@ export class WorkspaceService {
       if (live.runtimeIncarnation !== undefined && ended?.incarnation !== undefined && live.runtimeIncarnation !== ended.incarnation) return;
       live.error = ended ? `The agent runtime stopped (${ended.reason}) before this turn finished.` : 'The agent runtime stopped before this turn finished.';
       live.updatedAt = stamp();
+      for (const entry of live.timeline ?? []) if (entry.kind === 'tool' && ['running','pending'].includes(entry.status)) entry.status = 'interrupted';
       for (const tool of Object.values(live.tools ?? {}) as any[]) if (tool.status === 'running') tool.status = 'interrupted';
       await this.store.db.run('UPDATE ws_live SET value=? WHERE session_id=?', JSON.stringify(live), session.id);
       const partialText = (Object.values(live.texts ?? {}) as string[]).map(text => /<message(?:\s[^>]*)?>([\s\S]*)/.exec(text)?.[1]?.replace(/<\/message>[\s\S]*$/, '') ?? '').filter(Boolean).join('\n');
@@ -644,9 +645,25 @@ export class WorkspaceService {
 
   private reduceActivity(live: any, row: WorkspaceMailboxEvent) {
     const data = safeJson(row.content);
+    if (row.kind === 'runtime-start') {
+      if (live.running && live.runtimeRunId !== data.runtimeRunId) {
+        live.running = false;
+        live.waiting = false;
+        live.interrupted = true;
+        live.error = 'The agent runner restarted before this turn finished.';
+        live.updatedAt = row.timestamp;
+        for (const tool of Object.values(live.tools ?? {}) as any[])
+          if (tool.status === 'running' || tool.status === 'pending') tool.status = 'interrupted';
+        for (const entry of live.timeline ?? [])
+          if (entry.kind === 'tool' && ['running', 'pending'].includes(entry.status)) entry.status = 'interrupted';
+      }
+      return live;
+    }
+    // Late events from an older process cannot change the current turn.
+    if (row.kind !== 'turn-start' && live.runtimeRunId && data.runtimeRunId && live.runtimeRunId !== data.runtimeRunId) return live;
     if (row.kind === 'text-delta' || row.kind === 'tool') reduceTimeline(live.timeline ??= [], row.kind, data);
     if(row.kind==='turn-waiting'){live.waiting=true;live.running=false;}
-    else if (row.kind === 'turn-start') live = { running: true, startedAt: row.timestamp, tools: {}, texts: {}, timeline: [], usage:live.usage };
+    else if (row.kind === 'turn-start') live = { running: true, runtimeRunId: data.runtimeRunId, startedAt: row.timestamp, tools: {}, texts: {}, timeline: [], usage:live.usage };
     else if(row.kind==='usage') {if(data.reset===true)delete live.usage;else{const usage=parseContextUsage(data);if(usage)live.usage={...usage,updatedAt:row.timestamp};}}
     else if (row.kind === 'text-delta') live.texts[data.id] = typeof data.text === 'string' ? data.text : `${live.texts[data.id] ?? ''}${data.delta ?? ''}`;
     else if (row.kind === 'tool') live.tools[data.id] = { ...live.tools[data.id], ...data };
@@ -662,6 +679,7 @@ export class WorkspaceService {
     let state = previous ? JSON.parse(previous) : { running: false, tools: {}, texts: {} };
     const { automaticSummaries } = await this.store.settings();
     for (const row of rows) {
+      if (row.kind === 'runtime-start' && (!state.running || state.runtimeRunId === safeJson(row.content).runtimeRunId)) continue;
       state = this.reduceActivity(state,row);
       if (state.startedAt && !state.running && (Object.keys(state.tools ?? {}).length || state.timeline?.length)) {
         const key = liveActivityKey(state);
@@ -669,7 +687,8 @@ export class WorkspaceService {
         // Keep this display record out of session recency/title and agent mailbox writes.
         const activity = {id:`${id}:${key}`,role:'tool',text:'',files:[],timestamp:row.timestamp,
           data:{activityKey:key,startedAt:state.startedAt,endedAt:row.timestamp,
-            timeline:state.timeline,phase:state.waiting?'before-approval':undefined,
+            ...(state.interrupted ? {partialText:Object.values(state.texts ?? {}).join('\n')} : {}),
+            timeline:state.timeline,phase:state.interrupted?'interrupted':state.waiting?'before-approval':undefined,
             tools:Object.values(state.tools).map((tool:any)=>state.waiting&&tool.status==='running'?{...tool,status:'interrupted'}:tool),turnError:state.error}};
         await this.store.db.run(`INSERT INTO ws_messages (id,session_id,role,kind,text,timestamp,source,files,data)
           VALUES (?,?,'tool','activity','',?,'agent','[]',?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`,

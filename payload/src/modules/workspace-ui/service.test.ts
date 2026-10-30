@@ -195,3 +195,24 @@ it('archives full ordered output including reasoning on terminal events and repl
  expect(live.running).toBe(false);
  expect(live.timeline).toEqual(result.messages[0].data?.timeline);
 });
+
+
+it('interrupts an old runner timeline once and preserves a new runner turn', async () => {
+ await store.addSession({id:'restart-case',agentId:'assistant'});
+ const row=(seq:number,kind:string,data:any)=>({seq,kind,timestamp:`2026-10-30T00:00:0${seq}.000Z`,content:JSON.stringify(data)});
+ const old=[row(1,'turn-start',{runtimeRunId:'old'}),row(2,'tool',{runtimeRunId:'old',id:'sleep',name:'bash',status:'running',output:'preserve this'})];
+ await (service as any).archiveActivity('restart-case',old);
+ await (service as any).applyEvents('restart-case',old);
+ const restart=[row(3,'runtime-start',{runtimeRunId:'new'})];
+ const previous=(await store.db.get<any>('SELECT value FROM ws_activity_cursors WHERE session_id=?','restart-case'))!.value;
+ await (service as any).archiveActivity('restart-case',restart,previous);
+ await (service as any).applyEvents('restart-case',restart);
+ expect(await service.live('restart-case')).toMatchObject({running:false,interrupted:true,tools:{sleep:{status:'interrupted',output:'preserve this'}}});
+ expect((await store.history('restart-case')).messages.filter(m=>m.kind==='activity')).toHaveLength(1);
+ const next=[row(4,'turn-start',{runtimeRunId:'new'}),row(5,'tool',{runtimeRunId:'new',id:'read',name:'Read',status:'running'})];
+ await (service as any).applyEvents('restart-case',next);
+ await (service as any).applyEvents('restart-case',[row(6,'turn-cancelled',{runtimeRunId:'old'})]);
+ expect(await service.live('restart-case')).toMatchObject({running:true,runtimeRunId:'new',tools:{read:{status:'running'}}});
+ await (service as any).applyEvents('restart-case',[row(7,'runtime-start',{runtimeRunId:'new'})]);
+ expect((await service.live('restart-case')).running).toBe(true);
+});

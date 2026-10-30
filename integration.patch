@@ -350,17 +350,24 @@ index 359cb94..a7ff632 100644
    });
  
 diff --git a/container/agent-runner/src/poll-loop.ts b/container/agent-runner/src/poll-loop.ts
-index e4d7982..e258cfe 100644
 --- a/container/agent-runner/src/poll-loop.ts
 +++ b/container/agent-runner/src/poll-loop.ts
 @@ -1,3 +1,6 @@
 +import {approvalWait,checkApprovalWait} from './approval-wait.js';
 +import { randomUUID } from 'node:crypto';
-+import { renderWorkspaceContext, emitWorkspaceEvent, acknowledgeWorkspaceReconfigure, holdWorkspaceReconfigure } from './workspace-context.js';
++import { initializeWorkspaceRun, renderWorkspaceContext, emitWorkspaceEvent, acknowledgeWorkspaceReconfigure, holdWorkspaceReconfigure } from './workspace-context.js';
  import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
  import {
    getPendingMessages,
-@@ -108,6 +111,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+@@ -82,6 +85,7 @@
+  * 6. Loop
+  */
+ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
++  initializeWorkspaceRun();
+   // Contract providers declare these; a contractless (legacy payload)
+   // provider keeps declaring them as instance flags, exactly as before.
+   const legacy = config.provider as { supportsNativeSlashCommands?: boolean; emitsMidTurnText?: boolean };
+@@ -108,6 +112,7 @@
      if (rotateReason) {
        log(`Rotating session — ${rotateReason}; starting fresh`);
        clearContinuation(config.providerName);
@@ -368,7 +375,7 @@ index e4d7982..e258cfe 100644
        continuation = undefined;
      }
    }
-@@ -125,6 +129,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+@@ -125,6 +130,9 @@
    let pollCount = 0;
    let isFirstPoll = true;
    while (true) {
@@ -378,7 +385,7 @@ index e4d7982..e258cfe 100644
      if (config.signal?.aborted) return;
      // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
      const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
-@@ -170,6 +177,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+@@ -170,6 +178,7 @@
          log('Clearing session (resetting continuation)');
          continuation = undefined;
          clearContinuation(config.providerName);
@@ -386,7 +393,7 @@ index e4d7982..e258cfe 100644
          await writeMessageOut({
            id: generateId(),
            kind: 'chat',
-@@ -240,7 +248,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+@@ -240,7 +249,7 @@
      log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
  
      const query = config.provider.query({
@@ -395,7 +402,7 @@ index e4d7982..e258cfe 100644
        continuation,
        cwd: config.cwd,
        systemContext: config.systemContext,
-@@ -289,6 +297,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+@@ -289,6 +298,7 @@
          log(`Stale session detected (${continuation}) — clearing for next retry`);
          continuation = undefined;
          clearContinuation(config.providerName);
@@ -403,7 +410,7 @@ index e4d7982..e258cfe 100644
        }
  
        // processQuery owns failure notices: it knows which active and queued
-@@ -305,7 +314,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+@@ -305,7 +315,8 @@
  
      // Ensure completed even if processQuery ended without a result event
      // (e.g. stream closed unexpectedly).
@@ -413,7 +420,7 @@ index e4d7982..e258cfe 100644
      log(`Completed ${ids.length} message(s)`);
    }
  }
-@@ -403,6 +413,9 @@ export async function processQuery(
+@@ -403,6 +414,9 @@
    // this?" truth lives in the outbound DB the door already writes to — no
    // in-process delivery ledger. Reset alongside midTurnSent at each result.
    let turnStartSeq = maxOutboundSeq();
@@ -423,7 +430,7 @@ index e4d7982..e258cfe 100644
    // Cross-segment assembly buffer: the unresolved TAIL of the previous text
    // event — an unclosed <message …> block (or a bare open-tag prefix like
    // "<mess" literally split mid-token), or an unclosed <internal span. Frame-
-@@ -426,6 +439,8 @@ export async function processQuery(
+@@ -426,6 +440,8 @@
    // archivePrompts. An empty initial prompt (a pre-warmed query) starts idle.
    let answering = initialPrompt !== '';
    type QueuedTurn = {
@@ -432,7 +439,7 @@ index e4d7982..e258cfe 100644
      routing: RoutingContext;
      unwrappedNudged: boolean;
      taskBlockNudged: boolean;
-@@ -438,17 +453,21 @@ export async function processQuery(
+@@ -438,17 +454,21 @@
    let nudgedWindow: SeqWindow | undefined;
    const adoptTurn = (next: QueuedTurn): void => {
      Object.assign(routing, next.routing);
@@ -455,7 +462,7 @@ index e4d7982..e258cfe 100644
      archivePrompts.push(archivePrompts[0] ?? initialPrompt);
    };
  
-@@ -502,6 +521,21 @@ export async function processQuery(
+@@ -502,6 +522,21 @@
          // follow-up is also pending; otherwise they stay pending for a future
          // batch (mirrors the two-phase initial-batch selection in
          // db/messages-in.ts).
@@ -477,7 +484,7 @@ index e4d7982..e258cfe 100644
          const hasFollowUpTrigger = pending.some((m) => m.kind !== 'system' && m.trigger === 1);
          const newMessages = pending.filter((m) => m.kind !== 'system' && (m.trigger === 1 || hasFollowUpTrigger));
          if (newMessages.length === 0) return;
-@@ -538,9 +572,10 @@ export async function processQuery(
+@@ -538,9 +573,10 @@
          const keptIds = keep.map((m) => m.id);
          const prompt = formatMessages(keep);
          log(`Pushing ${keep.length} follow-up message(s) into active query`);
@@ -489,7 +496,7 @@ index e4d7982..e258cfe 100644
            routing: extractRouting(keep),
            unwrappedNudged: false,
            taskBlockNudged: false,
-@@ -580,12 +615,29 @@ export async function processQuery(
+@@ -580,12 +616,29 @@
      })();
    }, ACTIVE_POLL_INTERVAL_MS);
  
@@ -519,7 +526,7 @@ index e4d7982..e258cfe 100644
          queryContinuation = event.continuation;
          // Persist immediately so a mid-turn container crash still lets the
          // next wake resume the conversation. Without this, the session id
-@@ -609,6 +661,7 @@ export async function processQuery(
+@@ -609,6 +662,7 @@
            midTurnTail = scan.tail;
          }
        } else if (event.type === 'result') {
@@ -527,7 +534,7 @@ index e4d7982..e258cfe 100644
          // A result — with or without text — means the turn is done. Mark
          // the initial batch completed now so the host sweep doesn't see
          // stale 'processing' claims while the query stays open for
-@@ -703,6 +756,7 @@ export async function processQuery(
+@@ -703,6 +757,7 @@
          // genuinely re-sending the same body still delivers. The assembly
          // buffer dies with the turn: a fragment that never closed is not
          // carried into the next turn — the wrap-nudge owns that case.
@@ -535,7 +542,7 @@ index e4d7982..e258cfe 100644
          midTurnSent = 0;
          midTurnReplied = 0;
          turnStartSeq = maxOutboundSeq();
-@@ -713,6 +767,7 @@ export async function processQuery(
+@@ -713,6 +768,7 @@
          else answering = false;
        }
      }
@@ -543,17 +550,17 @@ index e4d7982..e258cfe 100644
    } catch (err) {
      // Freeze the queue before awaiting notices. Follow-ups have already been
      // acknowledged, so an abandoned queued turn cannot rely on redelivery.
-@@ -755,6 +810,10 @@ export async function processQuery(
+@@ -754,6 +810,10 @@
+           );
          }
        }
-     }
++    }
 +    if (!cancelled) {
 +      if (answering) emitWorkspaceEvent('turn-finished', {id:notificationId,failed:true,ranges:[...notificationRanges,{after:turnStartSeq,upto:maxOutboundSeq()}]});
 +      for (const turn of queuedTurns) if (turn.notificationId) emitWorkspaceEvent('turn-finished', {id:turn.notificationId,failed:true,ranges:turn.notificationRanges ?? []});
-+    }
+     }
      // Continuation recovery receives the original error; diagnostics remain
      // in the exchange archive and runner log, never in the channel notice.
-     throw err;
 diff --git a/container/agent-runner/src/providers/claude.system-prompt.test.ts b/container/agent-runner/src/providers/claude.system-prompt.test.ts
 index 5686478..37657c2 100644
 --- a/container/agent-runner/src/providers/claude.system-prompt.test.ts

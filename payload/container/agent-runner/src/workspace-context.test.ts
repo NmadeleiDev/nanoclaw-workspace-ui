@@ -1,6 +1,7 @@
 import { beforeEach, afterEach, it, expect } from 'bun:test';
 import { initTestSessionDb, closeSessionDb } from './mailbox/sqlite/connection.js';
 import {
+  initializeWorkspaceRun,
   readWorkspaceContext,
   renderWorkspaceContext,
   emitWorkspaceEvent,
@@ -86,4 +87,15 @@ it('keeps buffered text parts and classification changes in arrival order',()=>{
   {id:'b',delta:'two',partType:'text'},
   {id:'a',delta:'three',partType:'reasoning'},
  ]);
+});
+
+it('stamps events with a process identity and records replacements without a chat turn', () => {
+ initializeWorkspaceRun();emitWorkspaceEvent('turn-start', {});
+ const rows=db.outbound.query('SELECT kind,content FROM workspace_events ORDER BY seq').all() as any[];
+ const id=JSON.parse(rows[0].content).runtimeRunId;
+ expect(rows[0].kind).toBe('runtime-start');expect(typeof id).toBe('string');
+ expect(JSON.parse(rows[1].content).runtimeRunId).toBe(id);
+ initializeWorkspaceRun();
+ const latest=db.outbound.query('SELECT content FROM workspace_events ORDER BY seq DESC LIMIT 1').get() as any;
+ expect(JSON.parse(latest.content).runtimeRunId).not.toBe(id);
 });
