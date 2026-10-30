@@ -63,8 +63,8 @@ export async function startWorkspaceServer(
     }
   }
   const clients = new Set<http.ServerResponse>();
-  const notify = () => {
-    for (const res of clients) if (!res.destroyed) res.write(`event: change\ndata: {}\n\n`);
+  const notify = (change: unknown = {}) => {
+    for (const res of clients) if (!res.destroyed) res.write(`event: change\ndata: ${JSON.stringify(change)}\n\n`);
   };
   service.events.on('change', notify);
   documentEvents.on('change',notify);

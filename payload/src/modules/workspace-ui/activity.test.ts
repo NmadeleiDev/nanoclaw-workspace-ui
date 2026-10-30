@@ -212,3 +212,20 @@ it.each([true, false])('queues completed turns before an immediate next turn (au
  expect(Object.values(summaries)).toHaveLength(2);
  for (const summary of Object.values(summaries)) expect(summary).toMatchObject({state:'completed',text:'Verified completed tool activity.'});
 });
+
+
+it.each([false, true])('notifies the owning session as summary work settles (failure: %s)', async failure => {
+ await saveLive(finished);
+ const changes:any[]=[];service.events.on('change',event=>changes.push(event));
+ await service.activitySummaries('chat');
+ expect(changes).toContainEqual({sessionId:'chat',metadata:false});
+ await ready();
+ if(failure) {
+  await store.db.run("UPDATE ws_utility_jobs SET attempts=2 WHERE task='activity-summary'");
+  vi.spyOn(service.models,'run').mockRejectedValue(new Error('Fixture failure'));
+ } else vi.spyOn(service.models,'run').mockResolvedValue('Finished successfully.');
+ changes.length=0;await service.work();
+ expect(changes).toEqual([{sessionId:'chat',metadata:false},{sessionId:'chat',metadata:false}]);
+ const summaries=await service.activitySummaries('chat');
+ expect(summaries[liveActivityKey(finished)].state).toBe(failure?'failed':'completed');
+});

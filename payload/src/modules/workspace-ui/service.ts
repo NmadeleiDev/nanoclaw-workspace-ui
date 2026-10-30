@@ -92,8 +92,8 @@ export class WorkspaceService {
     }
   }
 
-  changed(): void {
-    this.events.emit('change');
+  changed(sessionId?: string): void {
+    this.events.emit('change', sessionId ? { sessionId, metadata: false } : { metadata: true });
   }
 
   readonly skills = new WorkspaceSkills();
@@ -748,6 +748,7 @@ export class WorkspaceService {
       WHERE ws_activity_summaries.source_key<>excluded.source_key`, id,sessionId,source.key,sourceKey,source.evidence,stamp());
     if (retry) await this.store.db.run("UPDATE ws_utility_jobs SET state='pending',attempts=0,error=NULL,due_at=? WHERE id=? AND state='failed'",stamp(),`activity-summary:${id}`);
     await this.enqueue(id, 'activity-summary', sourceKey, retry ? 0 : 1000);
+    this.changed(sessionId);
   }
 
   async summarizeActivity(sessionId: string, key: string, messageIds?: unknown) {
@@ -809,6 +810,9 @@ export class WorkspaceService {
         stamp(),
       );
       if (!job) return;
+      const summarySessionId = job.task === 'activity-summary'
+        ? (await this.store.db.get<{session_id: string}>('SELECT session_id FROM ws_activity_summaries WHERE id=?', job.scope_id))?.session_id
+        : undefined;
       const claimed = await this.store.db.run(
         "UPDATE ws_utility_jobs SET state='running',updated_at=? WHERE id=? AND state='pending' AND source_key=?",
         stamp(),
@@ -816,12 +820,12 @@ export class WorkspaceService {
         job.source_key,
       );
       if (!claimed.changes) return;
-      this.changed();
+      this.changed(summarySessionId);
       try {
         if (job.task === 'activity-summary') {
           await this.workActivitySummary(job);
           await this.store.db.run("UPDATE ws_utility_jobs SET state='completed',error=NULL,updated_at=? WHERE id=? AND source_key=?",stamp(),job.id,job.source_key);
-          this.changed();
+          this.changed(summarySessionId);
           return;
         }
         const settings = await this.store.settings();
@@ -914,7 +918,7 @@ export class WorkspaceService {
           job.source_key,
         );
       }
-      this.changed();
+      this.changed(summarySessionId);
     } finally {
       this.working = false;
     }

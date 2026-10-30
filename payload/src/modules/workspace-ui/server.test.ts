@@ -541,3 +541,17 @@ it('reports idle cancellation honestly without dispatching an abort', async () =
  const response=await fetch(`${base}/api/sessions/idle-cancel/cancel`,{method:'POST',headers:{Cookie:cookie,'X-Workspace-Csrf':csrf,'Content-Type':'application/json'},body:'{}'});
  expect(response.status).toBe(200);expect(await response.json()).toEqual({requested:false,status:'idle'});expect(cancel).not.toHaveBeenCalled();
 });
+
+
+it('delivers the session identity through the authenticated live event stream', async () => {
+ const controller=new AbortController();
+ const response=await fetch(`${base}/api/events`,{headers:{Cookie:cookie},signal:controller.signal});
+ const reader=response.body!.getReader();
+ try {
+  expect(response.status).toBe(200);
+  await reader.read();
+  service.changed('summary-session');
+  const chunk=await reader.read();
+  expect(new TextDecoder().decode(chunk.value)).toContain('"sessionId":"summary-session","metadata":false');
+ } finally {controller.abort();await reader.cancel().catch(()=>{});}
+});
