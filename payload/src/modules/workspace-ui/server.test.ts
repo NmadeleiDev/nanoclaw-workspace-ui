@@ -15,6 +15,7 @@ import { runMigrations } from '../../db/migrations/index.js';
 import { WorkspaceStore } from './store.js';
 import { WorkspaceService } from './service.js';
 import { startWorkspaceServer } from './server.js';
+import { createPendingApproval, transitionPendingApprovalStatus, deletePendingApproval } from '../../db/sessions.js';
 
 let store: WorkspaceStore;
 let service: WorkspaceService;
@@ -79,6 +80,24 @@ it('serves the real protected API through pairing, CSRF, and role checks', async
   expect((await store.projects())[0].name).toBe('HTTP project');
   await store.db.run('DELETE FROM user_roles WHERE user_id=?', 'telegram:owner');
   expect((await fetch(`${base}/api/bootstrap`, { headers: { Cookie: cookie } })).status).toBe(403);
+});
+
+it('rejects unsupported session backends before creating a session', async () => {
+  await store.db.run('INSERT INTO agent_groups(id,name,folder,created_at) VALUES(?,?,?,?)', 'fixture', 'Fixture', 'fixture', new Date().toISOString());
+  await ensureContainerConfig('fixture', 'claude');
+  const create = vi.fn().mockResolvedValue('docker-api');
+  (service as any).bridge = { create };
+  const post = (runtimeDriver: string) => fetch(`${base}/api/sessions`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json', 'X-Workspace-Csrf': csrf },
+    body: JSON.stringify({ agentId: 'fixture', runtimeDriver }),
+  });
+  const rejected = await post('unsupported-backend');
+  expect(rejected.status).toBe(400);
+  expect(await rejected.json()).toMatchObject({ error: 'This add-on supports Docker sessions.' });
+  expect(create).not.toHaveBeenCalled();
+  expect((await post('docker')).status).toBe(201);
+  expect(create).toHaveBeenCalledWith('fixture', 'docker');
 });
 
 it('persists appearance through the protected settings API and rejects invalid presets', async () => {
@@ -435,4 +454,81 @@ it('returns cached tool-activity summaries through the session API', async () =>
   await service.work();
   expect((await get()).activitySummaries['live:2026-10-28T00:00:00.000Z'].text).toBe('Ran the test suite; all eight tests passed.');
   expect(generate).toHaveBeenCalledOnce();generate.mockRestore();
+});
+
+it('dismisses only expired approvals, preserves the approval record and survives fresh service reads',async()=>{
+ const expired='2000-01-01T00:00:00.000Z';const future='2999-01-01T00:00:00.000Z';
+ for(const [id,deadline] of [['old',expired],['active',future]])await store.db.run(
+  'INSERT INTO pending_approvals (approval_id,request_id,action,payload,created_at,expires_at,title) VALUES (?,?,?,?,?,?,?)',id,id,'test','{}',new Date().toISOString(),deadline,'Allow access?');
+ const pending=await service.pending();expect(pending.find(row=>row.id==='old')?.status).toBe('expired');
+ const dismiss=(id:string,headers:Record<string,string>)=>fetch(`${base}/api/requests/${id}`,{method:'DELETE',headers});
+ expect((await dismiss('old',{})).status).toBe(401);
+ expect((await dismiss('old',{Cookie:cookie})).status).toBe(403);
+ const headers={Cookie:cookie,'X-Workspace-Csrf':csrf};
+ expect((await dismiss('active',headers)).status).toBe(409);
+ expect((await dismiss('old',headers)).status).toBe(200);
+ expect((await dismiss('old',headers)).status).toBe(200);
+ expect((await new WorkspaceService(store).pending()).map(row=>row.id)).toEqual(['active']);
+ expect(await store.db.get('SELECT status FROM pending_approvals WHERE approval_id=?','old')).toMatchObject({status:'pending'});
+ expect(await store.db.all('SELECT * FROM ws_dismissed_requests')).toHaveLength(1);
+});
+
+it('accepts bounded optional decision comments only through the authenticated CSRF-protected API', async()=>{
+ const respond=vi.fn().mockResolvedValue(undefined);(service as any).bridge={respond};
+ const post=(comment:unknown,headers:Record<string,string>)=>fetch(`${base}/api/requests/comment-demo`,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify({value:'approve',comment})});
+ expect((await post('Review first',{})).status).toBe(401);
+ expect((await post('Review first',{Cookie:cookie})).status).toBe(403);
+ const headers={Cookie:cookie,'X-Workspace-Csrf':csrf};
+ expect((await post('x'.repeat(2001),headers)).status).toBe(400);
+ expect((await post({text:'invalid'},headers)).status).toBe(400);
+ expect(respond).not.toHaveBeenCalled();
+ expect((await post('  Review first  ',headers)).status).toBe(200);
+ expect(respond).toHaveBeenCalledWith('telegram:owner','comment-demo','approve','Review first');
+});
+it('returns sanitized persistent decision history and an ordered event timeline', async()=>{
+ await createPendingApproval({approval_id:'history-demo',request_id:'history-demo',action:'test',payload:JSON.stringify({secret:'never expose this'}),options_json:'["approve","reject"]',title:'Allow a test?',created_at:new Date().toISOString()});
+ await transitionPendingApprovalStatus('history-demo','pending','rejected',{userId:'telegram:owner',comment:'Use the existing port.',value:'reject'});
+ await deletePendingApproval('history-demo');
+ expect((await fetch(`${base}/api/requests/history`)).status).toBe(401);
+ const response=await fetch(`${base}/api/requests/history`,{headers:{Cookie:cookie}});const history=await response.json() as any;
+ expect(history.items[0]).toMatchObject({id:'history-demo',decision_comment:'Use the existing port.',decision_value:'reject',decided_by:'telegram:owner',status:'rejected'});
+ const detail=await (await fetch(`${base}/api/requests/history-demo`,{headers:{Cookie:cookie}})).json() as any;
+ expect(detail.events.map((event:any)=>event.kind)).toEqual(['created','decision','archived']);
+ expect(JSON.stringify({history,detail})).not.toContain('never expose this');
+});
+
+it('returns bounded reasoning previews and full text through the authenticated output endpoint',async()=>{
+ await store.db.run('INSERT INTO agent_groups(id,name,folder,created_at) VALUES(?,?,?,?)','trace-agent','Trace','trace-agent',new Date().toISOString());
+ await store.addSession({id:'trace-chat',agentId:'trace-agent'});
+ const text='reasoning '.repeat(2000);
+ const startedAt='2026-10-29T00:00:00.000Z';
+ await store.db.run('INSERT INTO ws_live(session_id,value) VALUES(?,?)','trace-chat',JSON.stringify({running:true,startedAt,tools:{},texts:{},timeline:[{id:'reason',kind:'reasoning',text}]}));
+ const response=await fetch(`${base}/api/sessions/trace-chat`,{headers:{Cookie:cookie}});
+ const detail=await response.json() as any;
+ expect(detail.live.timeline[0].text).toHaveLength(4000);
+ const full=await fetch(base+detail.live.timeline[0].fullTextUrl,{headers:{Cookie:cookie}});
+ expect(await full.json()).toEqual({text});
+ expect((await fetch(base+detail.live.timeline[0].fullTextUrl)).status).toBe(401);
+});
+
+
+it('serves a completed turn summary while the next turn is running',async()=>{
+ await store.db.run('INSERT INTO agent_groups (id,name,folder,created_at) VALUES (?,?,?,?)','handoff-agent','Assistant','handoff-agent',new Date().toISOString());
+ await store.addSession({id:'handoff-chat',agentId:'handoff-agent'});
+ const events=[
+  {kind:'turn-start',content:{}},
+  {kind:'tool',content:{id:'read',name:'Read',status:'completed',output:'File read'}},
+  {kind:'turn-result',content:{}},
+  {kind:'turn-start',content:{}},
+ ].map((event,index)=>({...event,seq:index+1,timestamp:`2026-10-29T14:58:15.00${index}Z`,content:JSON.stringify(event.content)}));
+ await (service as any).archiveActivity('handoff-chat',events);
+ await (service as any).applyEvents('handoff-chat',events);
+ vi.spyOn(service.models,'run').mockResolvedValue('Read the requested file.');
+ await store.db.run("UPDATE ws_utility_jobs SET due_at=? WHERE task='activity-summary'",'2000-01-01T00:00:00.000Z');
+ await service.work();
+ const response=await fetch(`${base}/api/sessions/handoff-chat`,{headers:{Cookie:cookie}});
+ expect(response.status).toBe(200);
+ const detail=await response.json() as any;
+ expect(detail.live.running).toBe(true);
+ expect(detail.activitySummaries['live:2026-10-29T14:58:15.000Z:tools:read']).toMatchObject({state:'completed',text:'Read the requested file.'});
 });

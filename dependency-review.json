@@ -114,6 +114,19 @@
       "registry": "https://registry.npmjs.org/vitest/4.1.12",
       "knownAdvisories": [],
       "selectionReason": "Maintained V4 security backport preserves the tested upstream major-version contract; V5 is a separate migration."
+    },
+    {
+      "package": "pdfjs-dist",
+      "version": "6.4.299",
+      "latestStable": "6.4.299",
+      "deprecated": false,
+      "engines": {
+        "node": ">=22.13.0 || >=24"
+      },
+      "license": "Apache-2.0",
+      "registry": "https://registry.npmjs.org/pdfjs-dist/6.4.299",
+      "reviewedAt": "2026-10-29",
+      "securityReview": "GHSA-hq66-cqwq-w95j affects >=5.6.83 <6.2.108; selected version is patched. Display-only integration does not enable scripting."
     }
   ],
   "resolvedLockfileAudit": {

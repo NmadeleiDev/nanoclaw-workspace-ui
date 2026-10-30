@@ -379,7 +379,7 @@ export class WorkspaceNotifications {
       'SELECT thread_id FROM sessions WHERE id=?',
       session.nativeSessionId,
     );
-    if (!native?.thread_id?.startsWith('system:workspace:')) return;
+    if (!native?.thread_id?.startsWith('system:workspace:') && !native?.thread_id?.startsWith('system:tasks:')) return;
     const id = randomUUID();
     await this.store.db.transaction(async () => {
       const added = await this.store.db.run(

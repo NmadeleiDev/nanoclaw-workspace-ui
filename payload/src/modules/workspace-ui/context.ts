@@ -46,6 +46,7 @@ export async function workspaceContext(store: WorkspaceStore, sessionId: string)
   const projectDoc = project ? await store.document('project', project.id) : null;
   return JSON.stringify({
     version: 1,
+    approvalProtocol: 1,
     sessionId: work.id,
     projectId: project?.id ?? null,
     title: work.title,

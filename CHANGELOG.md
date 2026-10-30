@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Show backend-reported context occupancy below the composer, including cached context, model-aware limits, persisted readings and mobile layout.
+- Remove the vertical guide beside sidebar conversations.
+
+- Refactor approvals into a durable lifecycle: ten-minute action decisions, provider deadline bounds, optional decision comments, atomic decision claims, ordered audit history and recoverable outcome delivery.
+- Add Pending and History views, application progress and result states, 90-day settled-history retention, and a safe way to ask the agent to reconsider rejected or expired requests.
+- Preserve activity around approval pauses; retain uncertain application results without automatically replaying side effects.
+
+- Mark expired approvals clearly and allow persistent dismissal from chat and the requests view without changing the underlying decision.
+
+- Preserve saved tool summaries when a turn moves from live activity into history, including earlier evidence formats.
+
 - Refresh the README and demo with all four themes, utility model options, mobile access and current chat features.
 - Keep session overviews concise, follow the latest conversational language and replace stale status with newer evidence.
 

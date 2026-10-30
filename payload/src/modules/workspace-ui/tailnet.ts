@@ -60,7 +60,7 @@ export class WorkspaceTailnet {
   constructor(
     private store: WorkspaceStore,
     private localPort: number,
-    private authorize: (origin: string | null) => void,
+    private authorize: (origin: string | null, paused?: boolean) => void,
     private changed: () => void,
     private preview = false,
     private cli = runtime,
@@ -76,8 +76,10 @@ export class WorkspaceTailnet {
     const name = String(state.Self?.DNSName ?? '')
       .replace(/\.$/, '')
       .toLowerCase();
-    if (state.BackendState !== 'Running' || !state.Self?.Online)
-      throw new Error('Connect this host to Tailscale first.');
+    // Self.Online describes control-plane connectivity, not whether private Serve traffic works.
+    // Keep verifying the running backend and the exact private route even during a control outage.
+    if (state.BackendState !== 'Running')
+      throw new Error('Connect this Mac to Tailscale first.');
     if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.ts\.net$/.test(name))
       throw new Error('Tailscale did not report a valid HTTPS device name.');
     const config = (await this.cli.json(['serve', 'status', '--json'])) as ServeConfig;
@@ -216,7 +218,7 @@ export class WorkspaceTailnet {
           this.error = reason;
           // Fail closed without destroying a potentially healthy Serve lease.
           // A later verified check restores access; confirmed unsafe routes above are released.
-          this.authorize(null);
+          this.authorize(null, true);
         }
         this.changed();
       }).catch((error) => {

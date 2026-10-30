@@ -97,6 +97,8 @@ it('refuses redirects so a local utility endpoint cannot forward private evidenc
     expect(call.instructions).toContain('Target 50–90 words');
     expect(call.instructions).toContain("latest substantive conversational language");
     expect(call.instructions).toContain('Translate these labels');
+    expect(call.instructions).toContain('Separate items with a blank line');
+    expect(call.instructions).toContain('- **Goal:** Short description.\n\n- **Now:** Current state.');
     expect(call.instructions).toContain('Never invent next actions or blockers');
     expect(call.instructions).toContain('New evidence must supersede stale status');
     expect(call.prompt).toContain(text);

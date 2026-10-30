@@ -15,6 +15,8 @@ let child: any;
 let enabledOrigin: string | null;
 let start: Mock<(args: string[]) => ChildProcess>;
 let checkFailure: Error | null;
+let backendState: string;
+let selfOnline: boolean;
 beforeEach(async () => {
   const db = await initTestDb();
   await runMigrations(db);
@@ -29,6 +31,8 @@ beforeEach(async () => {
   };
   enabledOrigin = null;
   checkFailure = null;
+  backendState = 'Running';
+  selfOnline = true;
   start = vi.fn((_args: string[]) => {
     child = Object.assign(new EventEmitter(), {
       stdout: new PassThrough(),
@@ -53,7 +57,7 @@ beforeEach(async () => {
     async json(args) {
       if (checkFailure) throw checkFailure;
       return args[0] === 'status'
-        ? { BackendState: 'Running', Self: { DNSName: 'mac.test.ts.net.', Online: true } }
+        ? { BackendState: backendState, Self: { DNSName: 'mac.test.ts.net.', Online: selfOnline } }
         : structuredClone(route);
     },
   };
@@ -155,4 +159,33 @@ it('still stops a changed or public route after a transient check failure', asyn
   expect(enabledOrigin).toBeNull();
   expect(child.kill).toHaveBeenCalledOnce();
   expect((await network.status()).running).toBe(false);
+});
+
+it('keeps verified private access when control-plane online status is false', async () => {
+  vi.useFakeTimers();
+  selfOnline = false;
+  await network.setEnabled(true);
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(enabledOrigin).toBe('https://mac.test.ts.net:8443');
+  expect((await network.status()).running).toBe(true);
+  expect(child.kill).not.toHaveBeenCalled();
+  route.AllowFunnel = { 'mac.test.ts.net:8443': true };
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(enabledOrigin).toBeNull();
+  expect(child.kill).toHaveBeenCalledOnce();
+});
+
+it('pauses access if the backend stops, then recovers the verified lease', async () => {
+  vi.useFakeTimers();
+  await network.setEnabled(true);
+  backendState = 'Stopped';
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(enabledOrigin).toBeNull();
+  expect((await network.status()).running).toBe(false);
+  backendState = 'Running';
+  selfOnline = false;
+  await vi.advanceTimersByTimeAsync(15000);
+  expect(enabledOrigin).toBe('https://mac.test.ts.net:8443');
+  expect((await network.status()).running).toBe(true);
+  expect(start).toHaveBeenCalledOnce();
 });

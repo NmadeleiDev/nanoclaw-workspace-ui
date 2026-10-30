@@ -1,4 +1,8 @@
-import { appendQuote, QuoteIcon, useMessageQuotes } from './quotes';
+import {DocumentViewer,openDocument} from './document-viewer';
+import {timelineMessageGroups,withLiveTimeline} from './timeline-messages';
+import { OutputTimeline, type TimelineEntry } from './timeline';
+import {ContextUsageIndicator,type ContextUsageValue} from './context-usage.js';
+import { ComposerQuotes, parseDraftQuotes, serializeQuotedMessage, type DraftQuote, QuoteIcon, useMessageQuotes } from './quotes';
 import { isToolOnly, messageGroups, liveActivityKey, activityGroupKey } from '../../../src/modules/workspace-ui/activity';
 import { WorkspaceConnectionError, workspaceRequest } from './response';
 import { SpeechButton, SpeechSettings, type SpeechConfig } from './speech';
@@ -103,7 +107,7 @@ type Message = {
   source: string;
   kind: string;
   files: { id: string; name: string; mime?: string }[];
-  data?: { activityKey?: string; startedAt?: string; endedAt?: string; turnError?: string; tools?: { name: string; input: unknown; status?: string; output?: string; error?: string }[]; toolName?: string; sender?: string };
+  data?: { toolGroupKey?:string; running?:boolean; timeline?:TimelineEntry[]; partialText?:string; phase?:string; activityKey?: string; startedAt?: string; endedAt?: string; turnError?: string; tools?: { name: string; input: unknown; status?: string; output?: string; error?: string }[]; toolName?: string; sender?: string };
 };
 type Doc = { markdown: string; revision: number; author: string; updatedAt: string };
 type Profile = { provider: 'ollama' | 'apple' | 'agent'; model?: string; endpoint?: string; agentId?: string };
@@ -136,7 +140,10 @@ type Detail = {
   messages: Message[];
   next: string | null;
   live?: {
+    timeline?:TimelineEntry[];
+    usage?:ContextUsageValue;
     archived?: boolean;
+    waiting?:boolean;
     startedAt?: string;
     updatedAt?: string;
     running: boolean;
@@ -153,6 +160,8 @@ type Detail = {
     title: string;
     question?: string;
     status?: string;
+    application_state?:string;
+    expires_at?: string;
     options: (string | { label: string; value?: string })[];
   }[];
 };
@@ -384,7 +393,10 @@ function RichText({ text, quoteId }: { text: string; quoteId?: string }) {
         remarkPlugins={[remarkGfm]}
         components={{
           a: ({ children, href }) => (
-            <a href={href} target="_blank" rel="noopener noreferrer">
+            <a href={href} target="_blank" rel="noopener noreferrer" onClick={event=>{
+              const documentLink=/^\/api\/sessions\/([^/]+)\/documents\/([a-f0-9]+)$/.exec(href??'');
+              if(documentLink){event.preventDefault();window.dispatchEvent(new CustomEvent('workspace-document-open',{detail:{session:decodeURIComponent(documentLink[1]),documentId:documentLink[2]}}));}
+            }}>
               {children}
             </a>
           ),
@@ -640,6 +652,8 @@ function ActivitySummaryAction({sessionId, groupKey, messageIds, summary, notify
 
 function SessionFiles({ id, version, notify }: { id: string; version: number; notify: (s: string) => void }) {
   const [files, setFiles] = useState<Message['files']>([]);
+  const [workingDocuments,setWorkingDocuments]=useState<Array<{id:string;source:{path?:string}}>>([]);
+  useEffect(()=>{const load=()=>void api(`/sessions/${id}/documents`).then(value=>setWorkingDocuments(value.documents.filter((d:any)=>d.source.path))).catch(e=>notify(String(e)));load();window.addEventListener('workspace-change',load);return()=>window.removeEventListener('workspace-change',load);},[id,version]);
   useEffect(() => {
     void api<Message['files']>(`/sessions/${id}/files`)
       .then(setFiles)
@@ -649,11 +663,12 @@ function SessionFiles({ id, version, notify }: { id: string; version: number; no
     <>
       <div className="context-session-info">
         <span className="eyebrow">SESSION FILES</span>
-        <h3>{files.length ? `${files.length} attachments` : 'No attachments yet'}</h3>
+        <h3>{files.length + workingDocuments.length ? `${files.length + workingDocuments.length} files` : 'No files yet'}</h3>
       </div>
       <div className="message-files">
+        {workingDocuments.map(doc=><button className="file-card" key={doc.id} onClick={()=>window.dispatchEvent(new CustomEvent('workspace-document-open',{detail:{session:id,documentId:doc.id}}))}>{doc.source.path}</button>)}
         {files.map((file) => (
-          <a className="file-card" key={file.id} href={`/api/files/${file.id}`} download={file.name}>
+          <a className="file-card" key={file.id} onClick={e=>{e.preventDefault();openDocument(id,file.id);}} href={`/api/files/${file.id}`}  download={file.name}>
             {file.mime?.startsWith('image/') && file.mime !== 'image/svg+xml' ? (
               <img src={`/api/files/${file.id}?inline=1`} alt={file.name} loading="lazy" />
             ) : (
@@ -661,7 +676,7 @@ function SessionFiles({ id, version, notify }: { id: string; version: number; no
             )}
             <span>
               {file.name}
-              <small>Download attachment</small>
+              <small>Open document</small>
             </span>
           </a>
         ))}
@@ -670,21 +685,52 @@ function SessionFiles({ id, version, notify }: { id: string; version: number; no
   );
 }
 
+function ApprovalRequestsView({children,notify}:{children:React.ReactNode;notify:(s:string)=>void}) {
+ const [tab,setTab]=useState('pending');const [items,setItems]=useState<any[]>([]);const [next,setNext]=useState<string|null>(null);const [busy,setBusy]=useState(false);const [events,setEvents]=useState<Record<string,any[]>>({});
+ const load=async(before?:string)=>{setBusy(true);try{const page=await api<any>(`/requests/history${before?`?before=${encodeURIComponent(before)}`:''}`);setItems(old=>before?[...old,...page.items]:page.items);setNext(page.next);}catch(e){notify(String(e));}finally{setBusy(false);}};
+ return <><div className="context-tabs" role="tablist" aria-label="Request views">
+ <button role="tab" aria-selected={tab==='pending'} onClick={()=>setTab('pending')}>Pending</button>
+ <button role="tab" aria-selected={tab==='history'} onClick={()=>{setTab('history');void load();}}>History</button></div>
+ {tab==='pending'?children:<div className="form-body" role="tabpanel" aria-label="Approval history">
+ {!items.length&&!busy&&<p className="muted">No resolved approvals in the last 90 days.</p>}
+ {items.map(item=><article className="question-card approval-history-entry" key={item.id}><h3>{item.title}</h3>
+ <p className="approval-history-result">{({approved:'Approved',rejected:'Denied',expired:'Expired',cancelled:'Cancelled'} as Record<string,string>)[item.status]??item.status}{['session','agent','connection'].includes(item.decision_value)?` · This ${item.decision_value}`:''} · {({not_started:'Not applied',applying:'Applying',applied:'Applied',failed:'Failed',uncertain:'Uncertain'} as Record<string,string>)[item.application_state]??item.application_state}</p><p className="approval-history-time">{fullTime(item.decided_at??item.archived_at)}</p>
+ <p className="muted">{item.decided_by?`Decision by ${item.decided_by}`:'System outcome'}</p>
+ <details onToggle={e=>{if(e.currentTarget.open&&!events[item.id])void api<any>(`/requests/${item.id}`).then(value=>setEvents(old=>({...old,[item.id]:value.events}))).catch(err=>notify(String(err)));}}><summary>Request and lifecycle</summary><RichText text={item.question??''}/><ul>{events[item.id]?.map(event=><li key={event.id}>{event.kind} · {fullTime(event.created_at)}</li>)}</ul></details>
+ {item.decision_comment&&<blockquote><strong>Comment to agent</strong><p>{item.decision_comment}</p></blockquote>}
+ {['rejected','expired'].includes(item.status)&&<button className="button secondary small" disabled={busy} onClick={async()=>{setBusy(true);try{await api(`/requests/${item.id}/retry`,'POST',{});notify('Asked the agent to reassess. No permission was granted.');}catch(e){notify(String(e));}finally{setBusy(false);}}}>Ask agent again</button>}
+ </article>)}
+ {busy&&<p role="status">Loading…</p>}{next&&<button className="button secondary" disabled={busy} onClick={()=>void load(next)}>Earlier requests</button>}
+ </div>}</>;
+}
+
 function RequestCard({
   request,
   answer,
+  dismiss,
 }: {
   request: Detail['pending'][number];
-  answer: (value: string) => Promise<void>;
+  answer: (value: string, comment?:string) => Promise<void>;
+  dismiss: () => Promise<void>;
 }) {
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
+  const [now,setNow] = useState(Date.now);
+  const deadline = request.expires_at ? Date.parse(request.expires_at) : NaN;
+  const applying=request.status==='approved'&&request.application_state==='applying';
+  const expired = request.type === 'approval' && (request.status === 'expired' || (!applying && deadline <= now));
+  useEffect(()=>{
+    if (!Number.isFinite(deadline) || deadline <= now) return;
+    const timer = setTimeout(()=>setNow(Date.now()),Math.min(deadline-now+20,1000));
+    return ()=>clearTimeout(timer);
+  },[deadline,now]);
+  const [comment,setComment]=useState('');
   const reasoning = request.status === 'awaiting_reason';
   const submit = async (value: string) => {
-    if (busy || !value.trim()) return;
+    if (busy || expired || applying || !value.trim()) return;
     setBusy(true);
     try {
-      await answer(value.trim());
+      await answer(value.trim(),request.type==='approval'?comment:undefined);
       setText('');
     } finally {
       setBusy(false);
@@ -695,9 +741,21 @@ function RequestCard({
       <div>
         <Icon name={request.type === 'approval' ? 'shield' : 'chat'} size={18} />
         <h3>{request.title}</h3>
+        {expired && <><span className="request-expired-label">Expired</span><button
+          type="button" className="icon-button" aria-label="Dismiss expired request" title="Dismiss this expired request"
+          disabled={busy} onClick={async()=>{if(busy)return;setBusy(true);try{await dismiss();}finally{setBusy(false);}}}>
+          <Icon name="close" size={18} />
+        </button></>}
       </div>
       {request.question && <RichText text={request.question} />}
-      {!reasoning && (
+      {request.type==='approval' && (!expired||!!comment.trim()) && !reasoning && <label className="approval-comment">Comment to agent <span className="muted">— optional</span>
+        <textarea value={comment} onChange={e=>setComment(e.target.value)} disabled={busy||expired||applying} maxLength={4000} rows={2}
+          placeholder="Add context to your approval or denial…" />
+        {expired&&comment.trim()&&<small>This comment was not sent.</small>}
+      </label>}
+      {(applying||busy)&&request.type==='approval'&&<p role="status">Applying your decision…</p>}
+      {!applying && !busy && !expired && request.expires_at && <p className="approval-deadline" role="timer">Expires {fullTime(request.expires_at)} · {Math.max(0,Math.ceil((deadline-now)/60000))} min remaining</p>}
+      {!applying && !expired && !reasoning && (
         <div className="question-options">
           {request.options.map((option, index) => (
             <button
@@ -712,7 +770,7 @@ function RequestCard({
           ))}
         </div>
       )}
-      {(reasoning || request.type === 'question') && (
+      {!expired && (reasoning || request.type === 'question') && (
         <form
           className="free-answer"
           onSubmit={(e) => {
@@ -2202,6 +2260,9 @@ function App() {
     JSON.parse(localStorage.getItem('ws.collapsed') ?? '{}'),
   );
   const [draft, setDraft] = useState('');
+  const [quoteDraft,setQuoteDraft]=useState<{session:string|null;items:DraftQuote[]}>({session:null,items:[]});
+  const draftQuotes=quoteDraft.session===sessionId?quoteDraft.items:[];
+  const quotesRef=useRef(draftQuotes);quotesRef.current=draftQuotes;
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const { files: attachments, add: addFiles, remove: removeAttachment, clear: clearAttachments, reading: readingAttachments } = useChatAttachments(sessionId, message => notify(message));
@@ -2219,6 +2280,7 @@ function App() {
   const [model, setModel] = useState('');
   const [modelValid, setModelValid] = useState(true);
   const [effort, setEffort] = useState('');
+  const [documentsVisible,setDocumentsVisible] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(Number(localStorage.getItem('ws.sidebar-width')) || 278);
   const [contextWidth, setContextWidth] = useState(Number(localStorage.getItem('ws.context-width')) || 354);
   const [allProjectAgents, setAllProjectAgents] = useState(false);
@@ -2471,6 +2533,8 @@ function App() {
     }
     localStorage.setItem('ws.session', sessionId);
     setDraft(localStorage.getItem(`ws.draft:${sessionId}`) ?? '');
+    try{setQuoteDraft({session:sessionId,items:parseDraftQuotes(localStorage.getItem(`ws.quotes:${sessionId}`))});}
+    catch{setQuoteDraft({session:sessionId,items:[]});notify('Stored quotes could not be read. Your saved data has been kept.');}
     clearAttachments();
     nearBottom.current = true;
     setDetail(null);
@@ -2551,38 +2615,47 @@ function App() {
     setDraft(text);
     localStorage.setItem(`ws.draft:${sessionId ?? `new:${agentId}`}`, text);
   };
-  const quoting = useMessageQuotes(sessionId ?? '', !!sessionId && detail?.session.id === sessionId && detail.session.origin !== 'openclaw' && !sending && !modal, text => {
-    const next = appendQuote(draftRef.current, text);
+  const quoting = useMessageQuotes(sessionId ?? '', !!sessionId && detail?.session.id === sessionId && detail.session.origin !== 'openclaw' && !sending && !modal, (text, source) => {
+    const items=[...quotesRef.current,{id:crypto.randomUUID(),text,source}];
+    const next=serializeQuotedMessage(draftRef.current,items);
     if (next.length > 100_000) { notify('That quote would make the message too long. Select a shorter passage.'); return false; }
-    draftRef.current = next;
-    setDraft(next);
-    try { localStorage.setItem(`ws.draft:${sessionId}`, next); }
+    quotesRef.current=items;
+    setQuoteDraft({session:sessionId,items});
+    try { localStorage.setItem(`ws.quotes:${sessionId}`, JSON.stringify(items)); }
     catch { notify('Quote added, but browser draft storage is full. Keep this conversation open until sending.'); }
+    if(source){
+      if(window.matchMedia('(max-width:900px)').matches)setPanel(false);
+      window.dispatchEvent(new CustomEvent('workspace-document-quoted',{detail:{session:sessionId}}));
+    }
     requestAnimationFrame(() => {
       const input = composer.current;
-      if (input) { input.focus(); input.setSelectionRange(next.length, next.length); input.scrollTop = input.scrollHeight; }
+      if (input) { input.focus(); input.setSelectionRange(draftRef.current.length, draftRef.current.length); input.scrollTop = input.scrollHeight; }
     });
     return true;
   });
   const send = async () => {
-    if (!sessionId || sending || speechBusy || readingAttachments || (!draft.trim() && !attachments.length)) return;
+    if (!sessionId || sending || speechBusy || readingAttachments || (!draft.trim() && !draftQuotes.length && !attachments.length)) return;
     const submissionSession = sessionId;
+    const messageText=serializeQuotedMessage(draft,draftQuotes);
+    if(messageText.length>100_000){notify('This message is too long. Shorten the reply or remove a quote.');return;}
     const payloadAttachments = attachments.map(({name,data,mimeType})=>({name,data,mimeType}));
     setSending(true);
     try {
       const hashBytes = await crypto.subtle.digest(
         'SHA-256',
-        new TextEncoder().encode(JSON.stringify({ text: draft, attachments: payloadAttachments })),
+        new TextEncoder().encode(JSON.stringify({ text: messageText, attachments: payloadAttachments })),
       );
       const hash = Array.from(new Uint8Array(hashBytes), (b) => b.toString(16).padStart(2, '0')).join('');
       const key = `ws.submission:${sessionId}`;
       const prior = JSON.parse(localStorage.getItem(key) ?? 'null');
       const id = prior?.hash === hash ? prior.id : crypto.randomUUID();
       localStorage.setItem(key, JSON.stringify({ id, hash }));
-      await api(`/sessions/${sessionId}/messages`, 'POST', { id, text: draft, attachments: payloadAttachments });
+      await api(`/sessions/${sessionId}/messages`, 'POST', { id, text: messageText, attachments: payloadAttachments });
       localStorage.removeItem(key);
       localStorage.removeItem(`ws.draft:${submissionSession}`);
+      localStorage.removeItem(`ws.quotes:${submissionSession}`);
       if (activeSession.current === submissionSession) {
+        setQuoteDraft({session:submissionSession,items:[]});quotesRef.current=[];
         updateDraft(''); clearAttachments(); nearBottom.current = true;
       }
       await refresh();
@@ -2746,7 +2819,6 @@ function App() {
           >
             <Icon name={p ? 'folder' : 'chat'} size={16} />
             <span>{p?.name ?? 'Unassigned'}</span>
-            <small>{sessions.length || ''}</small>
           </button>
           {p && (
             <button
@@ -2794,7 +2866,7 @@ function App() {
   return (
     <HomeDirectory.Provider value={data.homeDirectory}>
     <div
-      className={`workspace-shell ${mobileNav ? 'mobile-nav-open' : ''} ${panel && sessionId ? 'with-context' : ''}`}
+      className={`workspace-shell ${mobileNav ? 'mobile-nav-open' : ''} ${(panel || documentsVisible) && sessionId ? 'with-context' : ''}`}
       style={{ '--sidebar-width': `${sidebarWidth}px`, '--context-width': `${contextWidth}px` } as React.CSSProperties}
       onDragEnter={e => { if(Array.from(e.dataTransfer.types).includes('Files') && canAttachFiles && !(e.target as Element).closest?.('[role=dialog]')) { e.preventDefault();fileDragDepth.current++;setDraggingFiles(true); } }}
       onDragLeave={e => { if(Array.from(e.dataTransfer.types).includes('Files')) { fileDragDepth.current=Math.max(0,fileDragDepth.current-1);if(!fileDragDepth.current)setDraggingFiles(false); } }}
@@ -2952,16 +3024,14 @@ function App() {
           )}
         </div>
         <div className="sidebar-footer">
-          {data.pending?.length > 0 && (
-            <button
+          <button
               title="Review questions and approvals awaiting your answer"
               className="archive-toggle"
               onClick={() => setModal('requests')}
             >
               <Icon name="shield" size={16} />
-              Needs your answer<span>{data.pending.length}</span>
+              Requests{data.pending.filter(request=>request.status!=='expired').length>0&&<span>{data.pending.filter(request=>request.status!=='expired').length}</span>}
             </button>
-          )}
           <button
             className={`archive-toggle ${showArchive ? 'active' : ''}`}
             role="switch"
@@ -3109,6 +3179,7 @@ function App() {
                   }}
                 />
                 <span className="header-divider" />
+                <span id="document-reopen-slot" className="document-reopen-slot" />
                 <IconButton
                   tooltip={
                     panel ? 'Hide conversation notes, folders and files' : 'Show conversation notes, folders and files'
@@ -3204,12 +3275,15 @@ function App() {
                       ) : null}
                     </div>
                   )}
-                  {messageGroups(detail.messages).map((group) =>
-                    group.every(isToolOnly) ? (
+                  {timelineMessageGroups(withLiveTimeline(detail.messages,detail.live,sessionId!)).map((group) =>
+                    group.every(isToolOnly) && group.some(m=>m.data?.timeline?.length) ? (<React.Fragment key={group[0].id}>{group.map(m=><OutputTimeline key={m.id} entries={m.data?.timeline ?? []} running={m.data?.running}
+                        toolLabel={<ActivityLabel label={m.data?.running?'Working':m.data?.phase==='interrupted'?'Interrupted':m.data?.phase==='before-approval'?'Before approval':'Worked'} summary={m.data?.toolGroupKey ? detail.activitySummaries?.[m.data.toolGroupKey] : undefined} />}
+                        toolAction={!m.data?.running && m.data?.toolGroupKey ? <ActivitySummaryAction sessionId={sessionId!} groupKey={m.data.toolGroupKey} summary={detail.activitySummaries?.[m.data.toolGroupKey]} notify={notify} /> : null}
+                        delivered={detail.messages.filter(reply=>reply.role==='assistant' && reply.timestamp >= (m.data?.startedAt ?? '') && reply.timestamp <= (m.data?.endedAt ?? '')).map(reply=>reply.text)} />)}</React.Fragment>) : group.every(isToolOnly) ? (
                       <details className="live-tools history-tools" key={group[0].id}>
                         <summary title="Expand or collapse this group of tool steps">
                           <Icon name="terminal" size={15} />
-                          <ActivityLabel label="Worked" summary={detail.activitySummaries?.[activityGroupKey(group)]?.count === group.length ? detail.activitySummaries[activityGroupKey(group)] : undefined} /><span>{group.reduce((n, m) => n + (m.data?.tools?.length ?? 1), 0)} {group.reduce((n, m) => n + (m.data?.tools?.length ?? 1), 0) === 1 ? 'step' : 'steps'}</span>
+                          <ActivityLabel label={group[0].data?.phase==='interrupted'?'Interrupted':'Worked'} summary={detail.activitySummaries?.[activityGroupKey(group)]?.count === group.length ? detail.activitySummaries[activityGroupKey(group)] : undefined} /><span>{group.reduce((n, m) => n + (m.data?.tools?.length ?? 1), 0)} {group.reduce((n, m) => n + (m.data?.tools?.length ?? 1), 0) === 1 ? 'step' : 'steps'}</span>
                           <Icon name="down" size={13} />
                         </summary>
                         <ActivitySummaryAction sessionId={sessionId!} groupKey={activityGroupKey(group)} messageIds={group.map(message=>message.id)} summary={detail.activitySummaries?.[activityGroupKey(group)]?.count === group.length ? detail.activitySummaries[activityGroupKey(group)] : undefined} notify={notify} />
@@ -3223,6 +3297,7 @@ function App() {
                               <time>{fullTime(message.timestamp)}</time>
                             </div>
                             {message.text && <ProgressContent value={message.text} />}
+                            {message.data?.partialText && <ProgressContent value={message.data.partialText} label="Partial response" />}
                             {message.data?.turnError && <ProgressContent value={message.data.turnError} label="Turn error" />}
                             {message.data?.tools?.map((tool, i) => (
                               <details className="live-tool" key={i}>
@@ -3317,7 +3392,7 @@ function App() {
                                     <a
                                       className="file-card"
                                       key={file.id}
-                                      href={`/api/files/${file.id}`}
+                                      onClick={e=>{e.preventDefault();if(sessionId)openDocument(sessionId,file.id);}} href={`/api/files/${file.id}`}
                                       download={file.name}
                                     >
                                       {file.mime?.startsWith('image/') && file.mime !== 'image/svg+xml' ? (
@@ -3327,7 +3402,7 @@ function App() {
                                       )}
                                       <span>
                                         {file.name}
-                                        <small>Download attachment</small>
+                                        <small>Open document</small>
                                       </span>
                                       <Icon name="arrow" size={15} />
                                     </a>
@@ -3340,7 +3415,7 @@ function App() {
                       </React.Fragment>
                     ),
                   )}
-                  {detail.live && !detail.live.archived && Object.values(detail.live.tools ?? {}).length > 0 && (
+                  {detail.live && !detail.live.timeline?.length && !detail.live.archived && Object.values(detail.live.tools ?? {}).length > 0 && (
                     <details className="live-tools" open={detail.live.running}>
                       <summary title="Expand or collapse the agent’s tool activity">
                         <Icon name="terminal" size={15} />
@@ -3369,7 +3444,8 @@ function App() {
                       ))}
                     </details>
                   )}
-                  {detail.live?.running && (
+                  {detail.live?.waiting && <p role="status" className="import-notice">Waiting for your approval. New messages will be delivered after the decision. Use Stop to cancel this task.</p>}
+                  {detail.live?.running && !detail.live.timeline?.length && (
                     <div className="live-answer">
                       <div className="message-meta">
                         <Avatar agent={agent} small />
@@ -3398,9 +3474,10 @@ function App() {
                     <RequestCard
                       key={request.id}
                       request={request}
-                      answer={async (value) => {
+                      dismiss={async()=>{try{await api(`/requests/${request.id}`,'DELETE');await refresh();}catch(e){notify(String(e));}}}
+                      answer={async (value, comment) => {
                         try {
-                          await api(`/requests/${request.id}`, 'POST', { value });
+                          await api(`/requests/${request.id}`, 'POST', { value, comment });
                           await refresh();
                         } catch (e) {
                           notify(String(e));
@@ -3521,7 +3598,7 @@ function App() {
                         <span className="effort-label">{current?.effort ?? agent?.effort ?? ''}</span>
                         <Icon name="down" size={12} />
                       </button>
-                      {detail?.live?.running && (
+                      {(detail?.live?.running||detail?.live?.waiting) && (
                         <IconButton
                           tooltip="Request that the agent stop its current turn"
                           icon="stop"
@@ -3537,7 +3614,7 @@ function App() {
                         title="Send your message and attachments"
                         className="send-button"
                         aria-label="Send message"
-                        disabled={sending || speechBusy || readingAttachments || (!draft.trim() && !attachments.length)}
+                        disabled={sending || speechBusy || readingAttachments || (!draft.trim() && !draftQuotes.length && !attachments.length)}
                         onClick={() => void send()}
                       >
                         <Icon name="send" size={18} />
@@ -3552,6 +3629,7 @@ function App() {
                       ? ` · ${current.directories.length} attached ${current.directories.length === 1 ? 'folder' : 'folders'}`
                       : ''}
                   </span>
+                  <ContextUsageIndicator usage={detail?.live?.usage} model={current?.model || agent?.model || undefined} />
                   <span>
                     ↵ to send <i>·</i> ⇧↵ for a new line
                   </span>
@@ -3751,7 +3829,8 @@ function App() {
           </div>
         )}
       </main>
-      {panel && sessionId && current && (
+      {sessionId && <DocumentViewer api={api} key={sessionId} session={sessionId} onVisibility={setDocumentsVisible} onContext={()=>setPanel(true)}/>}
+      {panel && !documentsVisible && sessionId && current && (
         <>
           <div
             className="resize-handle context-handle"
@@ -3945,16 +4024,18 @@ function App() {
         </div>
       )}
       {modal === 'requests' && (
-        <Dialog title="Needs your answer" close={() => setModal(null)}>
+        <Dialog title="Requests" close={() => setModal(null)}>
+          <ApprovalRequestsView notify={notify}>
           <div className="form-body" role="region" aria-label="Form fields" tabIndex={0}>
             {data.pending?.length ? (
               data.pending.map((request) => (
                 <RequestCard
                   key={request.id}
                   request={request}
-                  answer={async (value) => {
+                  dismiss={async()=>{try{await api(`/requests/${request.id}`,'DELETE');await refresh();}catch(e){notify(String(e));}}}
+                  answer={async (value, comment) => {
                     try {
-                      await api(`/requests/${request.id}`, 'POST', { value });
+                      await api(`/requests/${request.id}`, 'POST', { value, comment });
                       await refresh();
                     } catch (e) {
                       notify(String(e));
@@ -3967,6 +4048,7 @@ function App() {
               <p className="muted">All caught up.</p>
             )}
           </div>
+          </ApprovalRequestsView>
         </Dialog>
       )}
       {notificationTarget && (

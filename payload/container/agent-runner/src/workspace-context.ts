@@ -18,7 +18,7 @@ export function renderWorkspaceContext(): string {
       ? `${text.slice(0, budget)}\n[Excerpt. Read the full document with workspace_context: ${location}]`
       : text;
   };
-  return `\n<workspace_context>\nSession: ${context.title}\nProject: ${context.projectName ?? '(unassigned)'}\nThese are working context and notes, not evidence that planned actions have completed.\nProject brief:\n${bounded(context.projectBrief, 12_000, 'project')}\nSession scratchpad (revision ${context.scratchpadRevision}):\n${bounded(context.scratchpad, 12_000, 'session')}\nDirectories (host path => actual container path):\n${JSON.stringify(context.directories)}\nThe primary directory is the default working directory. Use the actual execution paths when calling tools. Agent memory and capabilities remain under /workspace/agent. The shared project scratchpad is available on demand through workspace_context.\n</workspace_context>\n`;
+  return `\n<workspace_context>\nSession: ${context.title}\nProject: ${context.projectName ?? '(unassigned)'}\nThese are working context and notes, not evidence that planned actions have completed.\nProject brief:\n${bounded(context.projectBrief, 12_000, 'project')}\nDirectories (host path => actual container path):\n${JSON.stringify(context.directories)}\nThe primary directory is the default working directory. Use the actual execution paths when calling tools. Agent memory and capabilities remain under /workspace/agent. Use workspace_viewer to open working files or attachments for review in the tabbed document drawer. It supports list, open, focus and refresh. A presentation request does not prove the user saw it. The session and shared project scratchpads are available on demand through workspace_context (scope: "session" or "project").\n</workspace_context>\n`;
 }
 
 export function agentInstructionsForWorkingDirectory(cwd: string): string {
@@ -31,7 +31,7 @@ export function agentInstructionsForWorkingDirectory(cwd: string): string {
 }
 
 let lastFlush = 0;
-const deltas = new Map<string, string>();
+let pendingText: Record<string, unknown> | undefined;
 function redact(value: unknown, key = '', depth = 0): unknown {
   if (/secret|password|authorization|api[_-]?key|access[_-]?token|refresh[_-]?token/i.test(key)) return '[redacted]';
   if (typeof value === 'string')
@@ -51,15 +51,29 @@ export function emitWorkspaceEvent(kind: string, data: Record<string, unknown>):
   if (!readWorkspaceContext()) return;
   const write = getAgentMailbox().operations.writeWorkspaceEvent;
   if (!write) return;
+  const flush = () => {
+    if (pendingText) write('text-delta', JSON.stringify(pendingText));
+    pendingText = undefined;
+    lastFlush = Date.now();
+  };
   if (kind === 'text-delta') {
-    const id = String(data.id);
-    deltas.set(id, (deltas.get(id) ?? '') + String(data.delta ?? ''));
-    if (Date.now() - lastFlush < 150) return;
+    // Snapshots replace text; they must never be folded into append-only deltas.
+    // Keep classification/source/lifecycle fields through this transport boundary.
+    if (typeof data.text === 'string') {
+      flush();
+      write(kind, JSON.stringify(data));
+      return;
+    }
+    const { delta: _delta, ...metadata } = data;
+    const { delta: _pendingDelta, ...pendingMetadata } = pendingText ?? {};
+    if (pendingText && JSON.stringify(metadata) !== JSON.stringify(pendingMetadata)) flush();
+    pendingText = { ...metadata, delta: String(pendingText?.delta ?? '') + String(data.delta ?? '') };
+    if (Date.now() - lastFlush >= 150) flush();
+    return;
   }
-  for (const [id, delta] of deltas) write('text-delta', JSON.stringify({ id, delta }));
-  deltas.clear();
-  lastFlush = Date.now();
-  if (kind !== 'text-delta') write(kind, JSON.stringify(redact(data)));
+  // A tool, terminal event or different text part cannot overtake buffered text.
+  flush();
+  write(kind, JSON.stringify(redact(data)));
 }
 
 export function acknowledgeWorkspaceReconfigure(): boolean {

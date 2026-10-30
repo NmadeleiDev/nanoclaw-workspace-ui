@@ -1,8 +1,7 @@
 diff --git a/container/agent-runner/src/providers/opencode-config.ts b/container/agent-runner/src/providers/opencode-config.ts
-index 9d9f0e6..2d2307a 100644
 --- a/container/agent-runner/src/providers/opencode-config.ts
 +++ b/container/agent-runner/src/providers/opencode-config.ts
-@@ -115,7 +115,7 @@ export function resolveOpenCodeInference(
+@@ -115,7 +115,7 @@
        // (e.g. `openrouter`, set alongside ANTHROPIC_BASE_URL per the
        // documented OpenRouter config) ship their own native ai-sdk
        // package and must keep OpenCode's default transport resolution.
@@ -11,7 +10,7 @@ index 9d9f0e6..2d2307a 100644
        options: { apiKey: OPENCODE_CREDENTIAL_PLACEHOLDER, ...(proxyUrl ? { baseURL: proxyUrl } : {}) },
        ...(modelsToRegister.length > 0
          ? {
-@@ -204,8 +204,8 @@ export function buildOpenCodeConfig(
+@@ -204,8 +204,8 @@
    >;
    return {
      ...inference,
@@ -22,19 +21,27 @@ index 9d9f0e6..2d2307a 100644
      autoupdate: false,
      snapshot: false,
      // Core's human-question tool waits up to five minutes. This request budget
-@@ -213,6 +213,6 @@ export function buildOpenCodeConfig(
+@@ -213,6 +213,6 @@
      experimental: { mcp_timeout: 330_000 },
      // The runner renders this file once per turn. Native steps, compaction
      // continuation and Task children reread it through the instructions pipeline.
 -    instructions: [`${AGENT_DIR}/CLAUDE.md`, `${AGENT_DIR}/CLAUDE.local.md`, openCodeInstructionsPath()],
+-  };
+-}
 +    instructions: options.utilityMode ? [] : [`${AGENT_DIR}/CLAUDE.md`, `${AGENT_DIR}/CLAUDE.local.md`, openCodeInstructionsPath()],
-   };
- }
++  };
++}
 diff --git a/container/agent-runner/src/providers/opencode-turn.ts b/container/agent-runner/src/providers/opencode-turn.ts
-index 1eb201e..45a9594 100644
 --- a/container/agent-runner/src/providers/opencode-turn.ts
 +++ b/container/agent-runner/src/providers/opencode-turn.ts
-@@ -32,7 +32,7 @@ export interface OpenCodeSessionClient {
+@@ -1,3 +1,6 @@
++import type { ProviderEvent } from './types.js';
++import {OpenCodeDisplay} from './opencode-display.js';
++import {openCodeContextUsage} from './context-usage.js';
+ import { randomBytes } from 'crypto';
+ 
+ export interface OpenCodeEvent {
+@@ -32,7 +35,7 @@
    create(params?: { signal?: AbortSignal }): Promise<{ data?: { id?: string }; error?: unknown }>;
    prompt(params: {
      path: { id: string };
@@ -43,15 +50,55 @@ index 1eb201e..45a9594 100644
      signal?: AbortSignal;
    }): Promise<{ data?: OpenCodeMessage; error?: unknown }>;
    messages(params: {
-@@ -172,6 +172,7 @@ export async function* executeOpenCodeTurn(options: {
+@@ -172,12 +175,14 @@
    parts: unknown[];
    /** Sent with every prompt: a resumed session otherwise keeps the model it was created with. */
    model?: OpenCodePromptModel;
++  contextWindow?: (provider:string,model:string)=>number|undefined;
 +  system?: string;
    signal: AbortSignal;
    silenceMs: number;
    idleMs: number;
-@@ -238,7 +239,7 @@ export async function* executeOpenCodeTurn(options: {
+   prepare?(): void | Promise<void>;
+   discard(): void;
+-}): AsyncGenerator<{ type: 'activity' } | { type: 'error'; message: string; retryable: false }, OpenCodeTurnResult> {
++}): AsyncGenerator<ProviderEvent, OpenCodeTurnResult> {
+   const { client, pump, sessionId, signal } = options;
+   const release = await acquireOpenCodeTurn(options.runtime, signal);
+   const request = new AbortController();
+@@ -186,6 +191,8 @@
+   let completedResponse = false;
+   let streamSilent = false;
+   let failure: Error | undefined;
++  const display = new OpenCodeDisplay();
++  const displayEvents: ProviderEvent[] = [];
+   let activity = false;
+   let lastActivityAt = Date.now();
+   let wake: (() => void) | undefined;
+@@ -205,6 +212,7 @@
+     // an independent limit that can cut off a recoverable native request.
+     // Only the synchronous response determines whether this turn succeeded.
+     if (event.type === 'session.idle' || event.type === 'session.error') return;
++    displayEvents.push(...display.accept(event.type, properties));
+     activity = true;
+     lastActivityAt = Date.now();
+     wake?.();
+@@ -229,6 +237,14 @@
+       signal,
+     );
+     if (prior.error) throw openCodeError(prior.error);
++    // Resume can recover the last measurement from the history read already
++    // required by this turn; no extra inference or history request is needed.
++    for(const message of [...(prior.data??[])].reverse()){
++      const info=message.info as unknown as Record<string,unknown>;
++      const usage=openCodeContextUsage(info,options.contextWindow?.(String(info.providerID),String(info.modelID)));
++      if(usage){yield {type:'display',kind:'usage',id:message.info.id,data:{...usage}};break;}
++    }
++
+     if (failure) throw failure;
+     await options.prepare?.();
+     if (failure) throw failure;
+@@ -238,7 +254,7 @@
      started = true;
      promptRequest = client.prompt({
        path: { id: sessionId },
@@ -60,14 +107,86 @@ index 1eb201e..45a9594 100644
        signal: request.signal,
      });
      void promptRequest.then(
+@@ -253,6 +269,7 @@
+       },
+     );
+     while (!finished && !failure) {
++      while(displayEvents.length) yield displayEvents.shift()!;
+       if (activity) {
+         activity = false;
+         yield { type: 'activity' };
+@@ -264,8 +281,12 @@
+       wake = undefined;
+     }
+     if (failure) throw failure;
++    while(displayEvents.length) yield displayEvents.shift()!;
+     if (response?.error) throw openCodeError(response.error);
+     if (!response?.data) throw new Error('OpenCode prompt returned no completed assistant');
++    const finalUsage=openCodeContextUsage(response.data.info as unknown as Record<string,unknown>,options.contextWindow?.(String((response.data.info as any).providerID),String((response.data.info as any).modelID)));
++    if(finalUsage)yield {type:'display',kind:'usage',id:response.data.info.id,data:{...finalUsage}};
++    unlisten(); // Completion is now reconciled from history, never racing late deltas.
+     const text = await reconcileOpenCodeTurn(
+       client,
+       sessionId,
+@@ -273,7 +294,13 @@
+       response.data,
+       new Set((prior.data ?? []).map((m) => m.info.id)),
+       signal,
++      (part, message) => displayEvents.push(...display.accept('message.part.updated', {
++        part: { ...part, sessionID: sessionId, messageID: message.info.id },
++      })),
+     );
++    // The HTTP completion can beat the final SSE chunks. Durable provider history
++    // is authoritative and must reconcile the display before the terminal event.
++    while (displayEvents.length) yield displayEvents.shift()!;
+     if (response.data.info.error) {
+       const message = openCodeError(response.data.info.error).message;
+       yield { type: 'error', message, retryable: false };
+@@ -318,6 +345,7 @@
+   result: OpenCodeMessage,
+   priorIds: ReadonlySet<string>,
+   signal: AbortSignal,
++  onPart?: (part: OpenCodeMessage['parts'][number], message: OpenCodeMessage) => void,
+ ): Promise<string | null> {
+   let messages: OpenCodeMessage[] = [];
+   let marker: OpenCodeMessage | undefined;
+@@ -363,6 +391,7 @@
+     if (message.info.summary || message.info.error) continue;
+     if (result.info.error && message.info.time.completed === undefined) continue;
+     for (const part of message.parts) {
++      if (!part.ignored) onPart?.(part, message);
+       if (part.type !== 'text' || part.ignored || !part.text || parts.has(part.id)) continue;
+       parts.add(part.id);
+       text.push(part.text);
 diff --git a/container/agent-runner/src/providers/opencode.ts b/container/agent-runner/src/providers/opencode.ts
-index 7f849c7..4ea4a39 100644
 --- a/container/agent-runner/src/providers/opencode.ts
 +++ b/container/agent-runner/src/providers/opencode.ts
-@@ -611,7 +611,9 @@ export class OpenCodeProvider implements AgentProvider {
+@@ -381,6 +381,7 @@
+  */
+ export interface OpenCodeRuntimeHandle {
+   client: {
++    provider?: {list(options?:{signal?:AbortSignal}):Promise<{data?:{all:Array<{id:string;models:Record<string,{limit?:{context?:number}}>} >};error?:unknown}>};
+     session: OpenCodeSessionClient;
+     postSessionIdPermissionsPermissionId?(params: {
+       path: { id: string; permissionID: string };
+@@ -582,6 +583,12 @@
+             unknown
+           >,
+         );
++        const limits=new Map<string,number>();
++        if(runtime.client.provider){
++          try{const metadata=await boundedOpenCodeCall(signal=>runtime.client.provider!.list({signal}),abort.signal,1500);
++            for(const provider of metadata.data?.all??[])for(const [model,value] of Object.entries(provider.models))if(value.limit?.context)limits.set(`${provider.id}/${model}`,value.limit.context);
++          }catch{log('Context-window metadata unavailable; usage will omit percentage.');}
++        }
+         while (!abort.signal.aborted) {
+           while (!pending.length && !ended && !abort.signal.aborted) {
+             await new Promise<void>((resolve) => {
+@@ -611,7 +618,10 @@
              sessionId,
              parts: [{ type: 'text', text: turn }],
              model: promptModel,
++            contextWindow:(provider,model)=>limits.get(`${provider}/${model}`),
 +            system: input.utility ? input.systemContext?.instructions : undefined,
              prepare: async () => {
 +              if (input.utility) return;

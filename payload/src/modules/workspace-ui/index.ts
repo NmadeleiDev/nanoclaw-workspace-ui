@@ -1,7 +1,7 @@
 import './migration.js';
 import './context-action.js';
 import { randomUUID } from 'node:crypto';
-import { onHostStart, onHostShutdown } from '../../host-lifecycle.js';
+import { onHostStart, onHostShutdown, onRuntimeEnded } from '../../host-lifecycle.js';
 import { getDb } from '../../db/connection.js';
 import { register } from '../../cli/registry.js';
 import { registerChannelAdapter } from '../../channels/channel-registry.js';
@@ -181,4 +181,10 @@ register({
     if (args.disable === true) return server.tailnet.setEnabled(false);
     return server.tailnet.status();
   },
+});
+
+onRuntimeEnded(async event => {
+  if (!service) return;
+  const session = await service.store.db.get<{id:string}>('SELECT id FROM ws_sessions WHERE native_session_id=?',event.sessionId);
+  if (session) await service.collect(await service.store.getSession(session.id),event);
 });

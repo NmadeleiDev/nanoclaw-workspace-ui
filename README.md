@@ -21,6 +21,8 @@ Turn NanoClaw into a daily workspace: projects with shared context, conversation
 | **Conversations with memory** | Keep revisioned session notes, project notes and background overviews. Bounded scratchpad previews expand when you want the whole picture. |
 | **An overview worth opening** | Recent conversations come first, with latest-message previews and visible unread indicators. Search across your workspace. |
 | **Tool activity you can follow** | Every completed turn keeps its own expandable **Worked** block beside the reply, with inputs, outputs and status. Optional short summaries explain the outcome at a glance. |
+| **Decisions with a record** | Ten-minute action approvals, optional comments, deadline-aware cards and a persistent decision history. Consent and successful application have separate states. |
+| **Context at a glance** | See the latest context occupancy below the composer, with token counts on hover and an honest unavailable state when a backend has no reading. |
 | **Quote and reply** | Select a passage in an agent reply and choose **Quote**, or quote the whole message. Your existing draft stays intact. **Alt/Option+Q** works too. |
 | **Images and files** | Paste images with ⌘V, drop files into chat, or use the attachment picker. Preview and remove attachments before sending. Image understanding depends on the model. |
 | **Local voice input** | Dictate through a standalone **whisper.cpp** server or the optional **MyWhispr** macOS CLI. Review and edit the transcript before sending. |

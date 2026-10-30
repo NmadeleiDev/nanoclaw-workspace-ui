@@ -52,6 +52,11 @@ if (!resume) {
   }
 }
 
+// Retained attachments live independently of per-session outboxes.
+if (!resume && fs.existsSync(path.join(projectRoot,'data/workspace-files'))) {
+ fs.cpSync(path.join(projectRoot,'data/workspace-files'),path.join(previewRoot,'data/workspace-files'),{recursive:true,dereference:false,filter:entry=>!fs.lstatSync(entry).isSymbolicLink()});
+}
+
 // Config constants resolve only after changing cwd to the isolated install root.
 process.chdir(previewRoot);
 const { initDb, closeDb } = await import('../src/db/connection.js');

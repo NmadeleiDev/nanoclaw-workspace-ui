@@ -18,11 +18,15 @@ export class WorkspaceAuth {
   ) {}
 
   private tailnetOrigin: string | null = null;
+  private tailnetPaused = false;
+  private knownTailnetOrigin: string | null = null;
 
-  configureTailnet(origin: string | null): void {
-    const old = this.tailnetOrigin;
+  configureTailnet(origin: string | null, paused = false): void {
+    this.tailnetPaused = paused;
+    const old = this.tailnetOrigin ?? this.knownTailnetOrigin;
     this.tailnetOrigin = origin;
-    if (old && old !== origin) {
+    if (origin) this.knownTailnetOrigin = origin;
+    if (old && old !== origin && !paused) {
       for (const [key, value] of this.tickets) if (value.origin === old) this.tickets.delete(key);
     }
   }
@@ -36,6 +40,11 @@ export class WorkspaceAuth {
       ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req?.socket.remoteAddress ?? '')
     )
       return this.tailnetOrigin;
+    if (this.tailnetPaused && !this.tailnetOrigin && this.knownTailnetOrigin &&
+      new URL(this.knownTailnetOrigin).host === host &&
+      ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req?.socket.remoteAddress ?? '')) {
+      throw Object.assign(new WorkspaceError(503, 'Remote workspace access is paused. Retrying the private connection.'), { code: 'workspace_access_paused' });
+    }
     throw new WorkspaceError(403, 'Invalid workspace host.');
   }
 
@@ -74,8 +83,8 @@ export class WorkspaceAuth {
       throw new WorkspaceError(
         401,
         usingCode
-          ? 'This code expired or was already used. Create a new code in Settings → Access on your workspace host. Codes last 10 minutes.'
-          : 'This link expired or was already used. Create another in Settings → Access on your workspace host.',
+          ? 'This code expired or was already used. Create a new code in Settings → Access on your Mac. Codes last 10 minutes.'
+          : 'This link expired or was already used. Create another in Settings → Access on your Mac.',
       );
     }
     if (ticket.origin !== this.requestOrigin(req)) {
@@ -178,7 +187,7 @@ export class WorkspaceAuth {
         )
       : undefined;
     if (!device || device.origin !== origin)
-      throw new WorkspaceError(401, 'Pair this browser using Settings → Access on your workspace host, or ncl workspace open.');
+      throw new WorkspaceError(401, 'Pair this browser using Settings → Access on your Mac, or ncl workspace open.');
     const csrf = hash(token + ':csrf').toString('hex');
     if (res) this.cookie(res, token!, origin);
     if (mutation) {

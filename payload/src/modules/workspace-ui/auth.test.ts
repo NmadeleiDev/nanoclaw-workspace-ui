@@ -79,3 +79,21 @@ it('isolates cookies by port and upgrades a valid legacy login without changing 
   expect((await auth.authorize(legacy,false,renewed)).ownerId).toBe('first-owner');
   expect(String(vi.mocked(renewed.setHeader).mock.calls[0][1])).toMatch(/^nc_workspace_3210=/);
 });
+
+it('distinguishes a paused verified host from an unknown host without authorizing either', () => {
+  auth.configureTailnet(null, true);
+  expect(() => auth.checkHost(request())).toThrow('Remote workspace access is paused');
+  try { auth.checkHost(request()); } catch (error) { expect(error).toMatchObject({status:503,code:'workspace_access_paused'}); }
+  expect(() => auth.checkHost(request('https://unknown.test:8443'))).toThrow('Invalid workspace host');
+  auth.configureTailnet(remote);
+  expect(() => auth.checkHost(request())).not.toThrow();
+});
+
+it('retains an unconsumed pairing through a temporary verification pause', async () => {
+  const link = auth.issue('owner',remote);
+  const code = auth.codeFor(link)!;
+  auth.configureTailnet(null,true);
+  await expect(auth.pair(code,response(),request())).rejects.toMatchObject({status:503});
+  auth.configureTailnet(remote);
+  await expect(auth.pair(code,response(),request())).resolves.toMatchObject({ownerId:'owner'});
+});

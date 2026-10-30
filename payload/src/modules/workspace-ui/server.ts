@@ -1,3 +1,7 @@
+import {WorkspaceDocuments,documentEvents} from './documents.js';
+import {previewTimeline} from './timeline.js';
+import {approvalHistory} from '../approvals/lifecycle.js';
+import {parseApprovalComment} from '../approvals/deadlines.js';
 import { DEFAULT_SPEECH, SpeechTranscriber, speechAudio, speechStatus, parseSpeech } from './speech.js';
 import { getProviderHostContract } from '../../provider-contracts/registry.js';
 import { agentModelSettings, updateAgentModelSettings } from '../../agent-model-settings.js';
@@ -44,6 +48,7 @@ export async function startWorkspaceServer(
     await service.store.db.run('INSERT INTO ws_settings (id,value) VALUES (?,?) ON CONFLICT(id) DO NOTHING','model-connections-imported',new Date().toISOString());
   }
   const speech = new SpeechTranscriber(path.join(service.filesRoot, '.dictation'));
+  const documents = new WorkspaceDocuments(service);
   const auth = new WorkspaceAuth(port, service.store.db);
   await service.notifications.start();
   const importer = new OpenClawImporter(service.store, service.filesRoot, () => service.changed());
@@ -62,6 +67,7 @@ export async function startWorkspaceServer(
     for (const res of clients) if (!res.destroyed) res.write(`event: change\ndata: {}\n\n`);
   };
   service.events.on('change', notify);
+  documentEvents.on('change',notify);
   const server = http.createServer((req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -109,6 +115,7 @@ export async function startWorkspaceServer(
         const mime: Record<string, string> = {
           '.html': 'text/html; charset=utf-8',
           '.js': 'text/javascript',
+          '.mjs':'text/javascript',
           '.css': 'text/css',
           '.woff2': 'font/woff2',
           '.svg': 'image/svg+xml',
@@ -123,6 +130,13 @@ export async function startWorkspaceServer(
       }
       const principal = await auth.authorize(req, !['GET', 'HEAD'].includes(method), res);
       if (!(await isOwner(principal.ownerId))) throw new WorkspaceError(403, 'Owner access has been revoked.');
+      const documentRoute=/^\/api\/sessions\/([^/]+)\/documents(?:\/([a-f0-9]+)(\/content)?)?$/.exec(route);
+      if(documentRoute){const [,session,id,content]=documentRoute;
+        if(method==='POST'&&!id)return json(await documents.open(session,await body(req)));
+        if(method==='GET'&&!id)return json({documents:await documents.list(session),requests:await documents.requests(session)});
+        if(method==='PUT'&&id){if(!service.bridge)throw new WorkspaceError(403,'Saving working files is disabled in preview.');const input=await body(req);return json(await service.exclusive(`document:${id}`,()=>documents.save(session,id,input.text,input.revision)));}
+        if(method==='GET'&&id){if(!content)return json(await documents.read(session,id));const file=await documents.download(session,id);res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`});if(file.fd!==undefined){const stream=fs.createReadStream('',{fd:file.fd,autoClose:true});stream.on('error',()=>res.destroy());res.on('close',()=>stream.destroy());stream.pipe(res);return;}return res.end(file.data);}
+      }
       if (route === '/api/speech' && method === 'GET') return json(await speechStatus((await service.store.settings()).speech ?? DEFAULT_SPEECH));
       if (route === '/api/speech/check' && method === 'POST') return json(await speechStatus(parseSpeech(await body(req))));
       if (route === '/api/speech/transcribe' && method === 'POST') {
@@ -309,6 +323,21 @@ export async function startWorkspaceServer(
       }
       if (route === '/api/sessions' && method === 'POST')
         return json(await service.createSession((await body(req)) as any), 201);
+      match = /^\/api\/sessions\/([^/]+)\/output$/.exec(route);
+      if (match && method === 'GET') {
+        const session = await service.store.getSession(match[1]);
+        const turn = url.searchParams.get('turn');
+        const part = url.searchParams.get('part');
+        const live = await service.live(session.id);
+        let timeline = live?.startedAt === turn ? live.timeline : undefined;
+        if (!timeline) {
+          const row = await service.store.db.get<{data:string}>('SELECT data FROM ws_messages WHERE session_id=? AND id=?',session.id,`${session.id}:live:${turn}`);
+          timeline = row ? JSON.parse(row.data).timeline : undefined;
+        }
+        const entry = timeline?.find((item:any)=>item.id===part);
+        if (!entry) throw new WorkspaceError(404,'Output is no longer available.');
+        return json({text:entry.text ?? ''});
+      }
       match = /^\/api\/sessions\/([^/]+)$/.exec(route);
       if (match && method === 'GET') {
         const session = await service.store.getSession(match[1]);
@@ -316,6 +345,9 @@ export async function startWorkspaceServer(
         if (!Number.isFinite(limit)) throw new WorkspaceError(400, 'Invalid page size.');
         const history = await service.store.history(session.id, url.searchParams.get('before') ?? undefined, limit);
         const live = await service.live(session.id);
+        for (const message of history.messages) if (message.data?.timeline)
+          message.data.timeline = previewTimeline(message.data.timeline as any,session.id,String(message.data.startedAt));
+        if (live?.timeline) live.timeline = previewTimeline(live.timeline,session.id,live.startedAt);
         return json({
           session,
           ...history,
@@ -423,13 +455,27 @@ export async function startWorkspaceServer(
         grantDirectories(request.directories);
         return json(inspectDirectories(request.directories));
       }
+      if(route==='/api/requests/history' && method==='GET')return json(await approvalHistory(url.searchParams.get('session')??undefined,url.searchParams.get('before')??undefined));
       if (route === '/api/requests' && method === 'GET') return json(await service.pending());
+      match = /^\/api\/requests\/([^/]+)\/retry$/.exec(route);
+      if(match && method==='POST'){
+        const row=await service.store.db.get<any>('SELECT * FROM pending_approvals WHERE approval_id=?',match[1]);
+        if(!row || !['rejected','expired'].includes(row.status))throw new WorkspaceError(409,'Only rejected or expired requests can be reconsidered.');
+        const session=await service.store.db.get<any>('SELECT id FROM ws_sessions WHERE native_session_id=?',row.session_id);
+        if(!session)throw new WorkspaceError(409,'The requesting conversation is no longer available.');
+        await service.send(session.id,principal.ownerId,{id:crypto.randomUUID(),text:`Please reconsider approval ${row.approval_id}. Inspect the task's current state and request fresh approval if it is still needed. Do not replay the previous operation automatically.`});
+        return json({requested:true},202);
+      }
       match = /^\/api\/requests\/([^/]+)$/.exec(route);
+      if(match && method==='GET'){const row=await service.store.db.get<any>('SELECT approval_id AS id,title,status,decision_value,application_state,decided_by,decided_at,decision_comment,expires_at FROM pending_approvals WHERE approval_id=?',match[1]);if(!row)throw new WorkspaceError(404,'Approval not found.');return json({request:row,events:await service.store.db.all('SELECT id,kind,created_at FROM approval_events WHERE approval_id=? ORDER BY sequence',match[1])});}
+      if (match && method === 'DELETE') return json(await service.dismissExpiredRequest(match[1]));
       if (match && method === 'POST') {
         if (!service.bridge) throw new WorkspaceError(503, 'Approvals cannot be changed in this isolated preview.');
-        const value = requiredText((await body(req)).value, 'Response', 10_000);
+        const response=await body(req);
+        const value = requiredText(response.value, 'Response', 10_000);
+        let comment:string|undefined;try{comment=parseApprovalComment(response.comment);}catch(e){throw new WorkspaceError(400,(e as Error).message);}
         const id = match[1];
-        await service.exclusive(`request:${id}`, () => service.bridge!.respond(principal.ownerId, id, value));
+        await service.exclusive(`request:${id}`, () => service.bridge!.respond(principal.ownerId, id, value, comment));
         return json({ resolved: true });
       }
       match = /^\/api\/files\/([a-f0-9]+)$/.exec(route);
@@ -461,7 +507,9 @@ export async function startWorkspaceServer(
           : error instanceof SyntaxError || error instanceof TypeError
             ? 400
             : 500;
-      json({ error: error instanceof Error ? error.message : String(error) }, status);
+      const code = (error as { code?: string }).code;
+      if (code === 'workspace_access_paused') res.setHeader('Retry-After', '5');
+      json({ error: error instanceof Error ? error.message : String(error), ...(code === 'workspace_access_paused' ? { code } : {}) }, status);
     });
   });
   server.requestTimeout = 360_000;
@@ -474,8 +522,8 @@ export async function startWorkspaceServer(
   const tailnet = new WorkspaceTailnet(
     service.store,
     port,
-    (origin) => {
-      auth.configureTailnet(origin);
+    (origin, paused) => {
+      auth.configureTailnet(origin, paused);
       service.notificationOrigin = origin;
     },
     () => service.changed(),
@@ -491,6 +539,7 @@ export async function startWorkspaceServer(
       await tailnet.stop();
       await importer.stop();
       service.events.off('change', notify);
+      documentEvents.off('change',notify);
       for (const res of clients) res.end();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },

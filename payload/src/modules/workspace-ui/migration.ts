@@ -136,3 +136,29 @@ export const workspaceActivityHistoryMigration: ModuleMigration = {
   },
 };
 registerMigration(workspaceActivityHistoryMigration);
+
+export const workspaceDismissedRequestsMigration: ModuleMigration = {
+  version: 7,
+  name: 'module:workspace-ui:dismissed-requests',
+  async up(db) {
+    await db.exec('CREATE TABLE ws_dismissed_requests (request_id TEXT PRIMARY KEY, dismissed_at TEXT NOT NULL)');
+  },
+};
+registerMigration(workspaceDismissedRequestsMigration);
+
+// Re-read retained mailbox events once to recover output hidden by the former UI.
+export const workspaceTimelineMigration: ModuleMigration = {
+  version: 8,
+  name: 'module:workspace-ui:ordered-output',
+  async up(db) {
+    await db.run("UPDATE ws_activity_cursors SET cursor=0,value=? WHERE cursor>0", JSON.stringify({running:false,tools:{},texts:{}}));
+    await db.run("UPDATE ws_cursors SET cursor=0 WHERE direction='event' AND cursor>0");
+  },
+};
+registerMigration(workspaceTimelineMigration);
+
+registerMigration({version:9,name:'module:workspace-ui:document-viewer',async up(db){
+ await db.exec(`CREATE TABLE ws_viewer_documents(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES ws_sessions(id) ON DELETE CASCADE,source TEXT NOT NULL);
+ CREATE TABLE ws_viewer_requests(seq INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL REFERENCES ws_sessions(id) ON DELETE CASCADE,request_id TEXT UNIQUE NOT NULL,action TEXT NOT NULL,document_id TEXT NOT NULL);
+ CREATE INDEX ws_viewer_requests_session ON ws_viewer_requests(session_id,seq);`);
+}});

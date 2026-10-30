@@ -29,14 +29,19 @@ beforeEach(() => {
     );
 });
 afterEach(closeSessionDb);
-it('reads fresh host context through the real mailbox without injecting the project scratchpad', () => {
+it('keeps both scratchpads available through the real mailbox without injecting their contents', () => {
   expect(readWorkspaceContext()?.scratchpadRevision).toBe(4);
   const text = renderWorkspaceContext();
-  expect(text).toContain('Decision B');
+  expect(readWorkspaceContext()?.scratchpad).toBe('Decision B');
+  expect(readWorkspaceContext()?.projectScratchpad).toBe('Full project notes on demand');
+  expect(text).toContain('Build it');
+  expect(text).toContain('scope: "session" or "project"');
+  expect(text).not.toContain('Decision B');
   expect(text).toContain('/workspace/extra/ws-repo');
   expect(text).not.toContain('Full project notes on demand');
   db.inbound.query('UPDATE workspace_context SET value=?').run(JSON.stringify({ scratchpad: 'Human correction C' }));
-  expect(renderWorkspaceContext()).toContain('Human correction C');
+  expect(readWorkspaceContext()?.scratchpad).toBe('Human correction C');
+  expect(renderWorkspaceContext()).not.toContain('Human correction C');
 });
 it('writes redacted tool activity and acknowledges the specific reconfigure request', () => {
   emitWorkspaceEvent('tool', {
@@ -53,4 +58,32 @@ it('writes redacted tool activity and acknowledges the specific reconfigure requ
   expect(db.outbound.query("SELECT value FROM session_state WHERE key='ws.reconfigure-ready'").get()).toEqual({
     value: 'nonce',
   });
+});
+
+it('preserves reasoning metadata and snapshots across the real mailbox, in tool order', () => {
+  emitWorkspaceEvent('turn-start', {});
+  emitWorkspaceEvent('text-delta', { id: 'r', partType: 'reasoning', sourceSessionId: 'child', text: '' });
+  emitWorkspaceEvent('text-delta', { id: 'r', partType: 'reasoning', sourceSessionId: 'child', delta: 'why' });
+  emitWorkspaceEvent('text-delta', { id: 'r', partType: 'reasoning', sourceSessionId: 'child', text: 'why', complete: true });
+  emitWorkspaceEvent('tool', {id:'tool',name:'Read',status:'completed'});
+  emitWorkspaceEvent('text-delta', {id:'answer',partType:'text',text:'x'.repeat(120001)});
+  emitWorkspaceEvent('turn-result', {});
+  const rows = db.outbound.query('SELECT kind,content FROM workspace_events ORDER BY seq').all() as any[];
+  expect(rows.map(row=>row.kind)).toEqual(['turn-start','text-delta','text-delta','text-delta','tool','text-delta','turn-result']);
+  expect(JSON.parse(rows[3].content)).toEqual({id:'r',partType:'reasoning',sourceSessionId:'child',text:'why',complete:true});
+  expect(JSON.parse(rows[5].content).text).toHaveLength(120001);
+});
+
+it('keeps buffered text parts and classification changes in arrival order',()=>{
+ emitWorkspaceEvent('turn-start',{});
+ emitWorkspaceEvent('text-delta',{id:'a',delta:'one',partType:'output'});
+ emitWorkspaceEvent('text-delta',{id:'b',delta:'two',partType:'text'});
+ emitWorkspaceEvent('text-delta',{id:'a',delta:'three',partType:'reasoning'});
+ emitWorkspaceEvent('turn-cancelled',{});
+ const rows=db.outbound.query("SELECT content FROM workspace_events WHERE kind='text-delta' ORDER BY seq").all() as any[];
+ expect(rows.map(row=>JSON.parse(row.content))).toEqual([
+  {id:'a',delta:'one',partType:'output'},
+  {id:'b',delta:'two',partType:'text'},
+  {id:'a',delta:'three',partType:'reasoning'},
+ ]);
 });

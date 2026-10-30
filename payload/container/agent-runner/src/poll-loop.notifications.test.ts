@@ -39,3 +39,13 @@ it('turns an error-only stream ending into a final failure instead of a reply',a
   await run((async function*(){yield {type:'error',message:'private',retryable:false} as ProviderEvent;})());
   expect(terminals()).toHaveLength(1);expect(terminals()[0].failed).toBe(true);
 });
+
+it('checkpoints the old turn even when an approval resolves before the next provider event',async()=>{
+ const {beginApprovalWait,checkApprovalWait}=await import('./approval-wait.js');
+ beginApprovalWait('fast-decision');
+ getInboundDb().query('UPDATE workspace_context SET control=?').run(JSON.stringify({kind:'approval_resolved',at:new Date(Date.now()+1000).toISOString()}));
+ await run((async function*(){yield {type:'result',text:'must not publish stale output'} as ProviderEvent;})());
+ expect(getOutboundDb().query("SELECT * FROM workspace_events WHERE kind='turn-waiting'").all()).toHaveLength(1);
+ expect(terminals()).toHaveLength(0);
+ expect(checkApprovalWait()).toBe(false);
+});

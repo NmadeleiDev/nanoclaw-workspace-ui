@@ -29,6 +29,28 @@ index 6aad079..52cfb56 100644
      provider: (raw.provider as string) || 'claude',
      assistantName: (raw.assistantName as string) || '',
      groupName: (raw.groupName as string) || '',
+diff --git a/container/agent-runner/src/db/messages-out.ts b/container/agent-runner/src/db/messages-out.ts
+index e24fa95..ef0ce89 100644
+--- a/container/agent-runner/src/db/messages-out.ts
++++ b/container/agent-runner/src/db/messages-out.ts
+@@ -21,6 +21,8 @@ export interface MessageOutRow {
+ }
+ 
+ export interface WriteMessageOut {
++  /** Atomically suspend the current task with this outbound request. */
++  approvalWait?: string;
+   id: string;
+   in_reply_to?: string | null;
+   deliver_after?: string | null;
+@@ -102,7 +104,7 @@ export function writeMessageOut(msg: WriteMessageOut): Promise<number> {
+     channelType: msg.channel_type,
+     threadId: msg.thread_id,
+     content: decorateContent(msg),
+-  });
++  }, msg.approvalWait);
+ }
+ 
+ export function getMessageIdBySeq(seq: number): string | null {
 diff --git a/container/agent-runner/src/index.ts b/container/agent-runner/src/index.ts
 index 811a583..1c76d45 100644
 --- a/container/agent-runner/src/index.ts
@@ -83,6 +105,28 @@ index 811a583..1c76d45 100644
      });
    } finally {
      await mailbox.stop();
+diff --git a/container/agent-runner/src/mailbox/model.generated.ts b/container/agent-runner/src/mailbox/model.generated.ts
+index c66bc7d..01f0677 100644
+--- a/container/agent-runner/src/mailbox/model.generated.ts
++++ b/container/agent-runner/src/mailbox/model.generated.ts
+@@ -19,7 +19,7 @@ export function parseIsoTimestamp(value: unknown): IsoTimestamp {
+   return value as IsoTimestamp;
+ }
+ 
+-export type ProcessingStatus = 'processing' | 'completed' | 'failed' | 'script-skip:error';
++export type ProcessingStatus = 'processing' | 'waiting_approval' | 'completed' | 'failed' | 'script-skip:error';
+ export type TaskStatus = 'pending' | 'paused' | 'completed' | 'failed' | 'cancelled';
+ export type InboundStatus = TaskStatus | 'processing';
+ 
+@@ -452,7 +452,7 @@ export function parseProcessingAckRecord(value: unknown): ProcessingAckRecord {
+   const record = strictRecord(value, 'ProcessingAckRecord', ['messageId', 'status', 'statusChanged']);
+   return {
+     messageId: text(record, 'messageId'),
+-    status: oneOf(record, 'status', ['processing', 'completed', 'failed', 'script-skip:error'] as const),
++    status: oneOf(record, 'status', ['processing', 'waiting_approval', 'completed', 'failed', 'script-skip:error'] as const),
+     statusChanged: timestamp(record, 'statusChanged'),
+   };
+ }
 diff --git a/container/agent-runner/src/mailbox/sqlite/connection.ts b/container/agent-runner/src/mailbox/sqlite/connection.ts
 index 33d509b..6021ae4 100644
 --- a/container/agent-runner/src/mailbox/sqlite/connection.ts
@@ -107,10 +151,11 @@ index 33d509b..6021ae4 100644
      // sweep can widen its stuck tolerance when Bash is running with a user-
      // declared long timeout. Forward-compat for older outbound.db files.
 diff --git a/container/agent-runner/src/mailbox/sqlite/index.ts b/container/agent-runner/src/mailbox/sqlite/index.ts
-index ec5ef0c..14cd183 100644
+index ec5ef0c..42efc9e 100644
 --- a/container/agent-runner/src/mailbox/sqlite/index.ts
 +++ b/container/agent-runner/src/mailbox/sqlite/index.ts
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,8 @@
++import {sqliteMarkWaiting,sqliteCheckpointApprovalWait} from './operations.js';
  import {
    closeSessionDb,
    readInbound,
@@ -118,7 +163,7 @@ index ec5ef0c..14cd183 100644
    sqliteClearContainerToolInFlight,
    sqliteClearStaleProcessingAcks,
    sqliteSetContainerToolInFlight,
-@@ -113,6 +114,17 @@ export class SqliteAgentMailbox implements AgentMailbox {
+@@ -113,6 +115,17 @@ export class SqliteAgentMailbox implements AgentMailbox {
      closeSessionDb();
    }
  
@@ -136,11 +181,79 @@ index ec5ef0c..14cd183 100644
    getPendingMessages(limit: number, isFirstPoll: boolean): InboundMessage[] {
      return sqliteGetPendingMessages(isFirstPoll, limit).flatMap((row) => {
        const message = parseInboundMessage(row);
+@@ -121,7 +134,8 @@ export class SqliteAgentMailbox implements AgentMailbox {
+   }
+ 
+   markMessages(ids: string[], status: ProcessingStatus): void {
+-    if (status === 'processing') sqliteMarkProcessing(ids);
++    if(status==='waiting_approval')sqliteMarkWaiting(ids);
++    else if (status === 'processing') sqliteMarkProcessing(ids);
+     else if (status === 'completed') sqliteMarkCompleted(ids);
+     else if (status === 'failed') ids.forEach(sqliteMarkFailed);
+     else sqliteMarkScriptSkipped(ids.map((id) => ({ id, reason: 'error' })));
+@@ -146,8 +160,8 @@ export class SqliteAgentMailbox implements AgentMailbox {
+     return row && inboundMessage(row);
+   }
+ 
+-  async writeMessageOut(message: Parameters<MailboxOperations['writeMessageOut']>[0]): Promise<number> {
+-    return sqliteWriteMessageOut(message);
++  async writeMessageOut(message: Parameters<MailboxOperations['writeMessageOut']>[0], approvalWait?: string): Promise<number> {
++    return sqliteWriteMessageOut(message, approvalWait);
+   }
+ 
+   getMessageIdBySeq(sequence: number): string | null {
+@@ -232,4 +246,5 @@ export class SqliteAgentMailbox implements AgentMailbox {
+ 
+   clearContainerToolInFlight = sqliteClearContainerToolInFlight;
+   clearStaleProcessingAcks = sqliteClearStaleProcessingAcks;
++  checkpointApprovalWait = sqliteCheckpointApprovalWait;
+ }
+diff --git a/container/agent-runner/src/mailbox/sqlite/operations.ts b/container/agent-runner/src/mailbox/sqlite/operations.ts
+index 1c35738..ede8662 100644
+--- a/container/agent-runner/src/mailbox/sqlite/operations.ts
++++ b/container/agent-runner/src/mailbox/sqlite/operations.ts
+@@ -116,7 +116,7 @@ export function sqliteFindCliResponse(requestId: string): MessageInRow | undefin
+   );
+ }
+ 
+-export function sqliteWriteMessageOut(message: OutboundWrite): number {
++export function sqliteWriteMessageOut(message: OutboundWrite, approvalWait?: string): number {
+   const outbound = getOutboundDb();
+   outbound.exec('BEGIN IMMEDIATE');
+   try {
+@@ -152,6 +152,7 @@ export function sqliteWriteMessageOut(message: OutboundWrite): number {
+         $thread_id: record.threadId,
+         $content: record.content,
+       });
++    if (approvalWait) sqliteCheckpointApprovalWait(approvalWait, new Date().toISOString());
+     outbound.exec('COMMIT');
+     return sequence;
+   } catch (error) {
+@@ -298,3 +299,19 @@ export function sqliteFindByRouting(channelType: string, platformId: string): De
+   );
+   return row && destination(row);
+ }
++
++export function sqliteMarkWaiting(ids:string[]){mark(ids,'waiting_approval');}
++
++/** Commit task ownership and the wait together before emitting a permission request. */
++export function sqliteCheckpointApprovalWait(correlationId: string, at: string): void {
++  const db = getOutboundDb();
++  db.transaction(() => {
++    const ids = (db.prepare("SELECT message_id FROM processing_ack WHERE status='processing'").all() as {message_id:string}[]).map(row=>row.message_id);
++    const previous = sqliteGetState('approval_wait_ids');
++    const saved = previous ? JSON.parse(previous.value) as string[] : [];
++    const all = [...new Set([...saved,...ids])];
++    sqliteSetState('approval_wait_ids', JSON.stringify(all));
++    sqliteSetState('approval_wait', JSON.stringify({correlationId,at}));
++    mark(all, 'waiting_approval');
++  })();
++}
 diff --git a/container/agent-runner/src/mailbox/types.ts b/container/agent-runner/src/mailbox/types.ts
-index e477362..e71d47f 100644
+index e477362..34c9548 100644
 --- a/container/agent-runner/src/mailbox/types.ts
 +++ b/container/agent-runner/src/mailbox/types.ts
-@@ -44,6 +44,8 @@ export type OutboundMessageDraft = OutboundWrite;
+@@ -44,13 +44,15 @@ export type OutboundMessageDraft = OutboundWrite;
  export type StateValue = Omit<StateRecord, 'key'>;
  
  export interface MailboxOperations {
@@ -149,6 +262,22 @@ index e477362..e71d47f 100644
    getPendingMessages(limit: number, isFirstPoll: boolean): InboundMessage[];
    markMessages(ids: string[], status: ProcessingStatus): void;
    markScriptSkipped(skips: Array<{ id: string; reason: string }>): void;
+   getMessageIn(id: string): InboundMessage | undefined;
+   findQuestionResponse(questionId: string): InboundMessage | undefined;
+   findCliResponse(requestId: string): InboundMessage | undefined;
+-  writeMessageOut(message: OutboundMessageDraft): Promise<number>;
++  writeMessageOut(message: OutboundMessageDraft, approvalWait?: string): Promise<number>;
+   getMessageIdBySeq(sequence: number): string | null;
+   getRoutingBySeq(sequence: number): SessionRouting | null;
+   getLatestInboundRoute(channelType: string, platformId: string): { threadId: string | null; inReplyTo: string } | null;
+@@ -70,6 +72,7 @@ export interface MailboxOperations {
+   setContainerToolInFlight(tool: string, declaredTimeoutMs: number | null): void;
+   clearContainerToolInFlight(): void;
+   clearStaleProcessingAcks(): void;
++  checkpointApprovalWait?(correlationId: string, at: string): void;
+ }
+ 
+ export interface AgentMailbox {
 diff --git a/container/agent-runner/src/mcp-tools/index.ts b/container/agent-runner/src/mcp-tools/index.ts
 index 592bf74..cfe4ede 100644
 --- a/container/agent-runner/src/mcp-tools/index.ts
@@ -221,25 +350,43 @@ index 359cb94..a7ff632 100644
    });
  
 diff --git a/container/agent-runner/src/poll-loop.ts b/container/agent-runner/src/poll-loop.ts
-index e4d7982..2c1662b 100644
+index e4d7982..e258cfe 100644
 --- a/container/agent-runner/src/poll-loop.ts
 +++ b/container/agent-runner/src/poll-loop.ts
-@@ -1,3 +1,5 @@
+@@ -1,3 +1,6 @@
++import {approvalWait,checkApprovalWait} from './approval-wait.js';
 +import { randomUUID } from 'node:crypto';
 +import { renderWorkspaceContext, emitWorkspaceEvent, acknowledgeWorkspaceReconfigure, holdWorkspaceReconfigure } from './workspace-context.js';
  import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
  import {
    getPendingMessages,
-@@ -125,6 +127,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+@@ -108,6 +111,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+     if (rotateReason) {
+       log(`Rotating session — ${rotateReason}; starting fresh`);
+       clearContinuation(config.providerName);
++      emitWorkspaceEvent('usage',{reset:true});
+       continuation = undefined;
+     }
+   }
+@@ -125,6 +129,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
    let pollCount = 0;
    let isFirstPoll = true;
    while (true) {
 +    if (config.signal?.aborted) return;
++    if(checkApprovalWait()){await sleep(POLL_INTERVAL_MS);continue;}
 +    await holdWorkspaceReconfigure(config.signal);
      if (config.signal?.aborted) return;
      // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
      const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
-@@ -240,7 +244,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+@@ -170,6 +177,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+         log('Clearing session (resetting continuation)');
+         continuation = undefined;
+         clearContinuation(config.providerName);
++      emitWorkspaceEvent('usage',{reset:true});
+         await writeMessageOut({
+           id: generateId(),
+           kind: 'chat',
+@@ -240,7 +248,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
      log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
  
      const query = config.provider.query({
@@ -248,7 +395,25 @@ index e4d7982..2c1662b 100644
        continuation,
        cwd: config.cwd,
        systemContext: config.systemContext,
-@@ -403,6 +407,9 @@ export async function processQuery(
+@@ -289,6 +297,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+         log(`Stale session detected (${continuation}) — clearing for next retry`);
+         continuation = undefined;
+         clearContinuation(config.providerName);
++      emitWorkspaceEvent('usage',{reset:true});
+       }
+ 
+       // processQuery owns failure notices: it knows which active and queued
+@@ -305,7 +314,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+ 
+     // Ensure completed even if processQuery ended without a result event
+     // (e.g. stream closed unexpectedly).
+-    markCompleted(processingIds);
++    if(checkApprovalWait()){getAgentMailbox().operations.setState('approval_wait_ids',JSON.stringify(processingIds));getAgentMailbox().operations.markMessages(processingIds,'waiting_approval');}
++    else markCompleted(processingIds);
+     log(`Completed ${ids.length} message(s)`);
+   }
+ }
+@@ -403,6 +413,9 @@ export async function processQuery(
    // this?" truth lives in the outbound DB the door already writes to — no
    // in-process delivery ledger. Reset alongside midTurnSent at each result.
    let turnStartSeq = maxOutboundSeq();
@@ -258,7 +423,7 @@ index e4d7982..2c1662b 100644
    // Cross-segment assembly buffer: the unresolved TAIL of the previous text
    // event — an unclosed <message …> block (or a bare open-tag prefix like
    // "<mess" literally split mid-token), or an unclosed <internal span. Frame-
-@@ -426,6 +433,8 @@ export async function processQuery(
+@@ -426,6 +439,8 @@ export async function processQuery(
    // archivePrompts. An empty initial prompt (a pre-warmed query) starts idle.
    let answering = initialPrompt !== '';
    type QueuedTurn = {
@@ -267,7 +432,7 @@ index e4d7982..2c1662b 100644
      routing: RoutingContext;
      unwrappedNudged: boolean;
      taskBlockNudged: boolean;
-@@ -438,17 +447,21 @@ export async function processQuery(
+@@ -438,17 +453,21 @@ export async function processQuery(
    let nudgedWindow: SeqWindow | undefined;
    const adoptTurn = (next: QueuedTurn): void => {
      Object.assign(routing, next.routing);
@@ -290,10 +455,11 @@ index e4d7982..2c1662b 100644
      archivePrompts.push(archivePrompts[0] ?? initialPrompt);
    };
  
-@@ -502,6 +515,20 @@ export async function processQuery(
+@@ -502,6 +521,21 @@ export async function processQuery(
          // follow-up is also pending; otherwise they stay pending for a future
          // batch (mirrors the two-phase initial-batch selection in
          // db/messages-in.ts).
++        if(approvalWait() || checkApprovalWait()){endedForCommand=true;query.abort();emitWorkspaceEvent('turn-waiting',{reason:'approval'});return;}
 +        const workspaceControl = getAgentMailbox().operations.workspaceContext?.()?.control;
 +        if (workspaceControl) {
 +          const command = JSON.parse(workspaceControl);
@@ -311,7 +477,7 @@ index e4d7982..2c1662b 100644
          const hasFollowUpTrigger = pending.some((m) => m.kind !== 'system' && m.trigger === 1);
          const newMessages = pending.filter((m) => m.kind !== 'system' && (m.trigger === 1 || hasFollowUpTrigger));
          if (newMessages.length === 0) return;
-@@ -538,9 +565,10 @@ export async function processQuery(
+@@ -538,9 +572,10 @@ export async function processQuery(
          const keptIds = keep.map((m) => m.id);
          const prompt = formatMessages(keep);
          log(`Pushing ${keep.length} follow-up message(s) into active query`);
@@ -323,7 +489,7 @@ index e4d7982..2c1662b 100644
            routing: extractRouting(keep),
            unwrappedNudged: false,
            taskBlockNudged: false,
-@@ -580,8 +608,23 @@ export async function processQuery(
+@@ -580,12 +615,29 @@ export async function processQuery(
      })();
    }, ACTIVE_POLL_INTERVAL_MS);
  
@@ -331,6 +497,7 @@ index e4d7982..2c1662b 100644
 +  emitWorkspaceEvent('turn-start', { queryStartedAt });
    try {
      for await (const event of query.events) {
++      if(approvalWait() || checkApprovalWait()){endedForCommand=true;query.abort();emitWorkspaceEvent('turn-waiting',{reason:'approval'});break;}
 +      const control = getAgentMailbox().operations.workspaceContext?.()?.control;
 +      if (control) {
 +        const command = JSON.parse(control);
@@ -347,7 +514,12 @@ index e4d7982..2c1662b 100644
        handleEvent(event, routing);
        touchHeartbeat();
  
-@@ -609,6 +652,7 @@ export async function processQuery(
+       if (event.type === 'init') {
++        if(event.continuation!==queryContinuation)emitWorkspaceEvent('usage',{reset:true});
+         queryContinuation = event.continuation;
+         // Persist immediately so a mid-turn container crash still lets the
+         // next wake resume the conversation. Without this, the session id
+@@ -609,6 +661,7 @@ export async function processQuery(
            midTurnTail = scan.tail;
          }
        } else if (event.type === 'result') {
@@ -355,7 +527,7 @@ index e4d7982..2c1662b 100644
          // A result — with or without text — means the turn is done. Mark
          // the initial batch completed now so the host sweep doesn't see
          // stale 'processing' claims while the query stays open for
-@@ -703,6 +747,7 @@ export async function processQuery(
+@@ -703,6 +756,7 @@ export async function processQuery(
          // genuinely re-sending the same body still delivers. The assembly
          // buffer dies with the turn: a fragment that never closed is not
          // carried into the next turn — the wrap-nudge owns that case.
@@ -363,7 +535,7 @@ index e4d7982..2c1662b 100644
          midTurnSent = 0;
          midTurnReplied = 0;
          turnStartSeq = maxOutboundSeq();
-@@ -713,6 +758,7 @@ export async function processQuery(
+@@ -713,6 +767,7 @@ export async function processQuery(
          else answering = false;
        }
      }
@@ -371,7 +543,7 @@ index e4d7982..2c1662b 100644
    } catch (err) {
      // Freeze the queue before awaiting notices. Follow-ups have already been
      // acknowledged, so an abandoned queued turn cannot rely on redelivery.
-@@ -755,6 +801,10 @@ export async function processQuery(
+@@ -755,6 +810,10 @@ export async function processQuery(
          }
        }
      }
@@ -417,10 +589,15 @@ index 5686478..37657c2 100644
 +  expect(controller.signal.aborted).toBe(true);
 +});
 diff --git a/container/agent-runner/src/providers/claude.ts b/container/agent-runner/src/providers/claude.ts
-index 1af8142..5311e92 100644
+index 1af8142..fc3054b 100644
 --- a/container/agent-runner/src/providers/claude.ts
 +++ b/container/agent-runner/src/providers/claude.ts
-@@ -262,6 +262,7 @@ export class ClaudeProvider implements AgentProvider {
+@@ -1,3 +1,4 @@
++import {claudeContextUsage} from './context-usage.js';
+ import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+ 
+ import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
+@@ -262,6 +263,7 @@ export class ClaudeProvider implements AgentProvider {
  
    query(input: QueryInput): AgentQuery {
      if (!this.memorySessionHook) throw new Error('Claude memory session hook was not registered');
@@ -428,7 +605,7 @@ index 1af8142..5311e92 100644
      const stream = new MessageStream();
      stream.push(input.prompt);
  
-@@ -270,19 +271,23 @@ export class ClaudeProvider implements AgentProvider {
+@@ -270,19 +272,23 @@ export class ClaudeProvider implements AgentProvider {
      const sdkResult = sdkQuery({
        prompt: stream,
        options: {
@@ -457,7 +634,7 @@ index 1af8142..5311e92 100644
          disallowedTools: [...this.executionPolicy.disallowedTools],
          // The SDK emits `assistant` only per completed content block, so a long
          // block is silent and the host sweep kills the container mid-generation.
-@@ -295,19 +300,21 @@ export class ClaudeProvider implements AgentProvider {
+@@ -295,23 +301,26 @@ export class ClaudeProvider implements AgentProvider {
          effort: this.inference.effort as any,
          permissionMode: this.executionPolicy.permissionMode,
          allowDangerouslySkipPermissions: this.executionPolicy.allowDangerouslySkipPermissions,
@@ -487,7 +664,12 @@ index 1af8142..5311e92 100644
        },
      });
  
-@@ -323,6 +330,30 @@ export class ClaudeProvider implements AgentProvider {
+     let aborted = false;
++    let lastContextAt=0;
+ 
+     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
+       let messageCount = 0;
+@@ -323,6 +332,30 @@ export class ClaudeProvider implements AgentProvider {
          // is working. Deltas arrive per token and carry no content for us, so
          // they count at most once per second, and not as messages.
          if (message.type === 'stream_event') {
@@ -518,7 +700,15 @@ index 1af8142..5311e92 100644
            const now = Date.now();
            if (now - lastStreamActivityAt < STREAM_ACTIVITY_INTERVAL_MS) continue;
            lastStreamActivityAt = now;
-@@ -351,15 +382,47 @@ export class ClaudeProvider implements AgentProvider {
+@@ -335,6 +368,7 @@ export class ClaudeProvider implements AgentProvider {
+         if (message.type === 'system' && message.subtype === 'init') {
+           yield { type: 'init', continuation: message.session_id };
+         } else if (message.type === 'assistant') {
++          if(Date.now()-lastContextAt>10000){lastContextAt=Date.now();const usage=await claudeContextUsage(sdkResult);if(usage)yield {type:'display',kind:'usage',id:'claude-context',data:{...usage}};}
+           // Surface each assistant message's text as it streams in. The final
+           // `result` event only carries the LAST assistant text — a wrapped
+           // <message> block composed between tool calls would otherwise be
+@@ -351,16 +385,49 @@ export class ClaudeProvider implements AgentProvider {
            // result reports. Blocks split across ASSISTANT MESSAGES (a tool
            // call between them) remain unparseable mid-turn by design; the
            // poll-loop's midTurnSent===0 fallback and wrap-nudge cover that.
@@ -566,9 +756,11 @@ index 1af8142..5311e92 100644
 +                },
 +              };
          } else if (message.type === 'result') {
++          const usage=await claudeContextUsage(sdkResult);if(usage)yield {type:'display',kind:'usage',id:'claude-context',data:{...usage}};
            // `result` text exists only on subtype:"success"; error subtypes
            // (e.g. a non-retryable 403 billing_error) carry their message in
-@@ -433,6 +496,7 @@ export class ClaudeProvider implements AgentProvider {
+           // `errors[]` instead. Keep that actionable notice separate from
+@@ -433,6 +500,7 @@ export class ClaudeProvider implements AgentProvider {
        events: translateEvents(),
        abort: () => {
          aborted = true;
@@ -604,6 +796,32 @@ index 9ae9d8e..3a61a92 100644
    | { type: 'init'; continuation: string }
    /**
     * A completed turn. `isError` marks a failed turn and prevents retries.
+diff --git a/src/cli/resources/approvals.ts b/src/cli/resources/approvals.ts
+index c2b3648..10217f1 100644
+--- a/src/cli/resources/approvals.ts
++++ b/src/cli/resources/approvals.ts
+@@ -6,7 +6,7 @@ registerResource({
+   plural: 'approvals',
+   table: 'pending_approvals',
+   description:
+-    'Pending approval — in-flight approval cards waiting for an admin response. Created by registered modules or the selected gateway. Rows are deleted after the admin approves/rejects or the request expires.',
++    'Approval decisions and retained history. Filter --status pending for in-flight cards. Resolved records are archived for 90 days; uncertain application results remain available.',
+   idColumn: 'approval_id',
+   columns: [
+     {
+@@ -47,6 +47,12 @@ registerResource({
+         'Current status. awaiting_reason means the admin chose "Reject with reason…" and the reply is still pending.',
+       enum: [...PENDING_APPROVAL_STATUSES],
+     },
++    { name: 'archived_at', type: 'string', description: 'When the request moved to history.' },
++    { name: 'decided_at', type: 'string', description: 'When the decision was recorded.' },
++    { name: 'decided_by', type: 'string', description: 'Namespaced deciding operator.' },
++    { name: 'decision_value', type: 'string', description: 'Selected response option.' },
++    { name: 'decision_comment', type: 'string', description: 'Submitted operator comment.' },
++    { name: 'application_state', type: 'string', description: 'Whether the approved action was applied, failed or remains uncertain.' },
+     { name: 'title', type: 'string', description: 'Card title shown to the admin.' },
+     { name: 'options_json', type: 'json', description: 'Card button options as JSON array.' },
+   ],
 diff --git a/src/container-config.ts b/src/container-config.ts
 index 9bb116f..5d12665 100644
 --- a/src/container-config.ts
@@ -635,16 +853,16 @@ index 9bb116f..5d12665 100644
    return config;
  }
 diff --git a/src/container-runner.ts b/src/container-runner.ts
-index 71c5038..c21acea 100644
 --- a/src/container-runner.ts
 +++ b/src/container-runner.ts
-@@ -1,3 +1,5 @@
+@@ -1,3 +1,6 @@
++import { publishRuntimeEnded } from './host-lifecycle.js';
 +import { workspaceModelContribution } from './modules/workspace-ui/model-provider.js';
 +import { selectedSkillNames } from './runtime-skills.js';
  /**
   * Container Runner v2
   *
-@@ -50,7 +52,6 @@ import type { ContainerSpec, MountSpec, SessionFailure, SessionSpec } from './dr
+@@ -50,7 +53,6 @@
  import {
    gatewayRuntimeIdentity,
    getGatewayProvider,
@@ -652,7 +870,7 @@ index 71c5038..c21acea 100644
    type GatewayContribution,
    type GatewaySessionInput,
    type GatewaySessionLease,
-@@ -60,6 +61,7 @@ import { initGroupFilesystem } from './group-init.js';
+@@ -60,6 +62,7 @@
  import { getAgentMailbox } from './mailbox/index.js';
  import { stopTypingRefresh } from './modules/typing/index.js';
  import { log } from './log.js';
@@ -660,7 +878,7 @@ index 71c5038..c21acea 100644
  import { validateAdditionalMounts } from './modules/mount-security/index.js';
  // Provider contracts use a separate barrel so update-skills identity detection
  // remains tied to src/providers/index.ts.
-@@ -207,6 +209,27 @@ async function releaseClaimQuietly(sessionId: string, incarnation: number): Prom
+@@ -207,6 +210,27 @@
   */
  const wakePromises = new Map<string, Promise<boolean>>();
  
@@ -688,7 +906,7 @@ index 71c5038..c21acea 100644
  /**
   * Sweep-run deferred-adoption retries in flight, keyed by session id (see
   * `retryPendingAdoptions`). Resolves false when the retry failed.
-@@ -388,6 +411,12 @@ async function retryPendingAdoption(sessionId: string): Promise<boolean> {
+@@ -388,6 +412,12 @@
   * next tick.
   */
  export function wakeContainer(session: Session): Promise<boolean> {
@@ -701,7 +919,7 @@ index 71c5038..c21acea 100644
    // The sweep is re-fencing this session's survivor (checked first: it may be
    // registered and mid-stop). Once it settles cleanly, wake again from a fresh
    // read, so a container it stopped or found gone is replaced now, not a tick
-@@ -457,7 +486,10 @@ async function spawnContainer(session: Session): Promise<void> {
+@@ -457,7 +487,10 @@
    // Materialize container.json from DB — writes fresh file and returns
    // the config object, threaded through provider resolution, buildMounts,
    // and buildContainerArgs so we don't re-read.
@@ -713,7 +931,7 @@ index 71c5038..c21acea 100644
  
    const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
    await initGroupFilesystem(agentGroup, { provider: providerName });
-@@ -468,10 +500,10 @@ async function spawnContainer(session: Session): Promise<void> {
+@@ -468,10 +501,10 @@
    const { provider, contribution, surfaces } = await resolveProviderContribution(session, agentGroup, containerConfig);
  
    const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
@@ -725,7 +943,7 @@ index 71c5038..c21acea 100644
    // Core calls the same idempotent provider operation for new and surviving
    // sessions. The returned typed contribution enters driver validation whole.
    const gatewaySession = await ensureGatewaySession({
-@@ -501,7 +533,7 @@ async function spawnContainer(session: Session): Promise<void> {
+@@ -501,7 +534,7 @@
        );
      }
  
@@ -734,7 +952,7 @@ index 71c5038..c21acea 100644
        agentGroup,
        session,
        containerName,
-@@ -510,7 +542,8 @@ async function spawnContainer(session: Session): Promise<void> {
+@@ -510,7 +543,8 @@
        contribution,
        gateway,
        mailboxEnvironment,
@@ -744,7 +962,15 @@ index 71c5038..c21acea 100644
  
      log.info('Spawning session', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
  
-@@ -1134,7 +1167,7 @@ export async function resolveProviderContribution(
+@@ -820,6 +854,7 @@
+ 
+   try {
+     await markContainerStopped(sessionId);
++    await publishRuntimeEnded({sessionId, incarnation:runtime.claimIncarnation, reason:runtime.stopReason ?? 'runtime-ended', timestamp:new Date().toISOString()});
+   } catch (err) {
+     log.error('Failed to record stopped container', { sessionId, containerName, err });
+   }
+@@ -1134,7 +1169,7 @@
      selectedSkills: selectedSkillNames(containerConfig),
      hostEnv: process.env,
    };
@@ -753,7 +979,7 @@ index 71c5038..c21acea 100644
    if (contract.legacyHostAdapter === 'required' && !fn) {
      throw new Error(`Provider '${provider}' host contract requires a legacy host adapter`);
    }
-@@ -1147,7 +1180,7 @@ export async function resolveProviderContribution(
+@@ -1147,7 +1182,7 @@
      context.sessionDir,
      context.selectedSkills,
      {
@@ -762,7 +988,7 @@ index 71c5038..c21acea 100644
        composeProjectDocument: (spec) => composeGroupProjectDoc(agentGroup, context.groupDir, spec),
      },
    );
-@@ -1226,7 +1259,8 @@ export async function buildMounts(
+@@ -1226,7 +1261,8 @@
    // read its config but cannot modify it. Composed per group, so 'group-state'
    // read-only rather than 'install-surface': the install-surface rule is an
    // enumerated release-surface allowlist, and this path is under the group.
@@ -772,7 +998,7 @@ index 71c5038..c21acea 100644
    if (fs.existsSync(containerJsonPath)) {
      mounts.push({
        hostPath: containerJsonPath,
-@@ -1569,24 +1603,6 @@ export function syncSkillSymlinks(
+@@ -1569,24 +1605,6 @@
    return selected;
  }
  
@@ -797,6 +1023,132 @@ index 71c5038..c21acea 100644
  
  const execAsync = promisify(exec);
  
+diff --git a/src/db/migrations/index.ts b/src/db/migrations/index.ts
+index 0e41129..31ca994 100644
+--- a/src/db/migrations/index.ts
++++ b/src/db/migrations/index.ts
+@@ -1,3 +1,4 @@
++import {migration028} from './028-approval-lifecycle.js';
+ import type Database from 'better-sqlite3';
+ 
+ import { log } from '../../log.js';
+@@ -93,6 +94,7 @@ export const migrations: Migration[] = [
+   migration023,
+   migration024,
+   migration025,
++  migration028,
+ ];
+ 
+ /**
+diff --git a/src/db/sessions.ts b/src/db/sessions.ts
+index af4551e..35baa02 100644
+--- a/src/db/sessions.ts
++++ b/src/db/sessions.ts
+@@ -1,3 +1,5 @@
++import {approvalEvent,archiveApproval} from '../modules/approvals/lifecycle.js';
++import {parseApprovalComment,approvalDeadline} from '../modules/approvals/deadlines.js';
+ import type { PendingApproval, PendingQuestion, Session } from '../types.js';
+ import { getDb, hasTable } from './connection.js';
+ 
+@@ -247,6 +249,7 @@ export async function createPendingApproval(
+       'approval_id' | 'request_id' | 'action' | 'payload' | 'created_at' | 'title' | 'options_json'
+     >,
+ ): Promise<boolean> {
++  return getDb().transaction(async()=>{
+   const result = await getDb().run(
+     `INSERT INTO pending_approvals
+          (approval_id, session_id, request_id, action, payload, created_at,
+@@ -264,18 +267,20 @@ export async function createPendingApproval(
+       platform_id: null,
+       instance: null,
+       platform_message_id: null,
+-      expires_at: null,
+       status: 'pending',
+       question: '',
+       approver_user_id: null,
+       ...pa,
++      expires_at:approvalDeadline(pa.created_at,pa.expires_at??undefined),
+     },
+   );
++  if(result.changes) await approvalEvent(getDb(),pa.approval_id,'created');
+   return result.changes > 0;
++  });
+ }
+ 
+ export async function getPendingApproval(approvalId: string): Promise<PendingApproval | undefined> {
+-  return getDb().get<PendingApproval>('SELECT * FROM pending_approvals WHERE approval_id = ?', approvalId);
++  return getDb().get<PendingApproval>('SELECT * FROM pending_approvals WHERE approval_id = ? AND archived_at IS NULL', approvalId);
+ }
+ 
+ /** Atomically claim one approval state transition. */
+@@ -283,46 +288,48 @@ export async function transitionPendingApprovalStatus(
+   approvalId: string,
+   expected: PendingApproval['status'],
+   status: PendingApproval['status'],
++  decision?: {userId?:string;comment?:string;value?:string},
+ ): Promise<boolean> {
+-  const result = await getDb().run(
+-    'UPDATE pending_approvals SET status = ? WHERE approval_id = ? AND status = ?',
+-    status,
+-    approvalId,
+-    expected,
+-  );
+-  return result.changes > 0;
++  return getDb().transaction(async()=>{
++    const result=await getDb().run(`UPDATE pending_approvals SET status=?,decided_at=?,decided_by=?,decision_comment=?,decision_value=?,application_state=? WHERE approval_id=? AND status=? AND archived_at IS NULL ${status==='approved'||(status==='rejected'&&expected==='pending')?'AND (expires_at IS NULL OR expires_at>?)':''}`,status,new Date().toISOString(),decision?.userId??null,parseApprovalComment(decision?.comment)??null,decision?.value??status,status==='approved'?'applying':'not_started',approvalId,expected,...(status==='approved'||(status==='rejected'&&expected==='pending')?[new Date().toISOString()]:[]));
++    if(result.changes)await approvalEvent(getDb(),approvalId,'decision',{status,userId:decision?.userId,comment:decision?.comment});
++    return result.changes>0;
++  });
+ }
+ 
+ /**
+  * Park an approval in the "rejected, awaiting reason" hold: the admin clicked
+  * "Reject with reason…" and we're waiting for their one-line reply. `expiresAt`
+  * is the deadline after which the host sweep finalizes a plain reject (so a
+- * ghosted hold never strands the requesting agent). Reuses the otherwise-unused
+- * `expires_at` column on module-initiated rows.
++ * ghosted hold never strands the requesting agent). Its reply deadline is
++ * separate from the original decision deadline.
+  */
+-export async function markApprovalAwaitingReason(approvalId: string, expiresAt: string): Promise<boolean> {
+-  const result = await getDb().run(
+-    "UPDATE pending_approvals SET status = 'awaiting_reason', expires_at = ? WHERE approval_id = ? AND status = 'pending'",
+-    expiresAt,
+-    approvalId,
+-  );
+-  return result.changes > 0;
++export async function markApprovalAwaitingReason(approvalId: string, expiresAt: string, userId?: string): Promise<boolean> {
++  return getDb().transaction(async () => {
++    const now = new Date().toISOString();
++    const result = await getDb().run(
++      "UPDATE pending_approvals SET status='awaiting_reason', reason_deadline_at=?, decided_by=?, decided_at=?, decision_value='reject_with_reason' WHERE approval_id=? AND status='pending' AND archived_at IS NULL AND (expires_at IS NULL OR expires_at>?)",
++      expiresAt, userId ?? null, now, approvalId, now,
++    );
++    if (result.changes) await approvalEvent(getDb(), approvalId, 'reason:awaiting', { userId });
++    return result.changes > 0;
++  });
+ }
+ 
+ /** Awaiting-reason approvals whose reply window has elapsed — the sweep's ghost set. */
+ export async function getExpiredAwaitingReasonApprovals(nowIso: string): Promise<PendingApproval[]> {
+   return getDb().all<PendingApproval>(
+-    "SELECT * FROM pending_approvals WHERE status = 'awaiting_reason' AND expires_at IS NOT NULL AND expires_at <= ?",
++    "SELECT * FROM pending_approvals WHERE status = 'awaiting_reason' AND reason_deadline_at IS NOT NULL AND reason_deadline_at <= ?",
+     nowIso,
+   );
+ }
+ 
+ export async function deletePendingApproval(approvalId: string): Promise<void> {
+-  await getDb().run('DELETE FROM pending_approvals WHERE approval_id = ?', approvalId);
++  await archiveApproval(approvalId);
+ }
+ 
+ export async function getPendingApprovalsByAction(action: string): Promise<PendingApproval[]> {
+-  return getDb().all<PendingApproval>('SELECT * FROM pending_approvals WHERE action = ?', action);
++  return getDb().all<PendingApproval>('SELECT * FROM pending_approvals WHERE action = ? AND archived_at IS NULL', action);
+ }
+ 
+ /**
 diff --git a/src/delivery.ts b/src/delivery.ts
 index 9a41dab..d423a7b 100644
 --- a/src/delivery.ts
@@ -904,15 +1256,44 @@ index b0f66a1..66b066b 100644
  }
  
 diff --git a/src/gateway-approval-coordinator.ts b/src/gateway-approval-coordinator.ts
-index 5050d8b..9d1dfda 100644
+index 5050d8b..0ba66ef 100644
 --- a/src/gateway-approval-coordinator.ts
 +++ b/src/gateway-approval-coordinator.ts
-@@ -1,3 +1,4 @@
+@@ -1,3 +1,6 @@
++import {applicationResult} from './modules/approvals/lifecycle.js';
++import {queueApprovalOutcome} from './modules/approvals/recovery.js';
 +import { isOperatorResponse } from './response-registry.js';
  import { gatewayApprovalPresentation } from './gateway-approval-presentation.js';
  import { permitsConfiguredGatewayRead, permitsUncredentialedGatewayRead } from './gateway-read-policy.js';
  import { getContainerConfig } from './db/container-configs.js';
-@@ -547,7 +548,7 @@ export async function handleGatewayApprovalResponse(payload: ResponsePayload): P
+@@ -41,7 +44,7 @@ const OPTIONS: RawOption[] = [
+ const MAX_TITLE_CHARS = 200;
+ const MAX_QUESTION_CHARS = 2_600;
+ const MAX_AUDIT_BYTES = 8_192;
+-const MAX_PROVIDER_APPROVAL_MS = 60 * 60_000;
++const MAX_PROVIDER_APPROVAL_MS = 10 * 60_000;
+ const CREDENTIAL_SCOPE_TIMEOUT_MS = 5_000;
+ /**
+  * A bridge that fails fast — a socket that will not bind, a gateway that is
+@@ -86,7 +89,7 @@ let unavailable = false;
+ let decisionGeneration = 0;
+ let initialReady: (() => void) | undefined;
+ let registeredResponseHandler = false;
+-let timeoutMs = 120_000;
++let timeoutMs = 600_000;
+ let maxPending = 32;
+ let reportUnavailable: (reason: string) => void = () => {};
+ let reportAvailable: () => void = () => {};
+@@ -114,7 +117,7 @@ export async function startGatewayApprovalCoordinator(
+   options: GatewayApprovalCoordinatorOptions = {},
+ ): Promise<void> {
+   if (controller) throw new Error('Gateway approval coordinator already started');
+-  timeoutMs = options.timeoutMs ?? 120_000;
++  timeoutMs = options.timeoutMs ?? 600_000;
+   maxPending = options.maxPending ?? 32;
+   adapter = deliveryAdapter;
+   healthGeneration++;
+@@ -547,7 +550,7 @@ export async function handleGatewayApprovalResponse(payload: ResponsePayload): P
      state = pending.get(payload.questionId);
      if (!(await isAuthorizedApprovalClick(approval, payload))) return true;
      if (
@@ -921,6 +1302,53 @@ index 5050d8b..9d1dfda 100644
        (payload.instance !== (approval.instance ?? approval.channel_type) ||
          payload.channelType !== approval.channel_type ||
          (payload.messageId !== undefined && payload.messageId !== approval.platform_message_id) ||
+@@ -563,6 +566,7 @@ export async function handleGatewayApprovalResponse(payload: ResponsePayload): P
+       approval.approval_id,
+       'pending',
+       decision === 'approve' ? 'approved' : 'rejected',
++      {userId:payload.userId??undefined,comment:payload.comment,value:payload.value},
+     );
+     if (!claimed) return true;
+     // The database claim owns the outcome; expiry must not override it while
+@@ -578,6 +582,7 @@ export async function handleGatewayApprovalResponse(payload: ResponsePayload): P
+       return true;
+     }
+     await editGatewayApprovalCard(approval, decision === 'approve' ? '✅ Approved' : '❌ Rejected');
++    if(decision==='approve')await applicationResult(approval.approval_id,'applied');
+     await deletePendingApproval(approval.approval_id);
+     if (state) settle(approval.approval_id, state, decision);
+     else {
+@@ -821,7 +826,7 @@ async function deliverDurableDecision(row: PendingApproval): Promise<void> {
+       row.request_id,
+       row.status === 'approved' ? 'approve' : row.status === 'expired' ? 'unavailable' : 'deny',
+     );
+-    if (accepted) await deletePendingApproval(row.approval_id);
++    if (accepted){if(row.status==='approved')await applicationResult(row.approval_id,'applied');await deletePendingApproval(row.approval_id);}
+   } catch (err) {
+     log.warn('Gateway decision retained for retry', { approvalId: row.approval_id, err });
+   }
+diff --git a/src/mailbox/model.ts b/src/mailbox/model.ts
+index c66bc7d..01f0677 100644
+--- a/src/mailbox/model.ts
++++ b/src/mailbox/model.ts
+@@ -19,7 +19,7 @@ export function parseIsoTimestamp(value: unknown): IsoTimestamp {
+   return value as IsoTimestamp;
+ }
+ 
+-export type ProcessingStatus = 'processing' | 'completed' | 'failed' | 'script-skip:error';
++export type ProcessingStatus = 'processing' | 'waiting_approval' | 'completed' | 'failed' | 'script-skip:error';
+ export type TaskStatus = 'pending' | 'paused' | 'completed' | 'failed' | 'cancelled';
+ export type InboundStatus = TaskStatus | 'processing';
+ 
+@@ -452,7 +452,7 @@ export function parseProcessingAckRecord(value: unknown): ProcessingAckRecord {
+   const record = strictRecord(value, 'ProcessingAckRecord', ['messageId', 'status', 'statusChanged']);
+   return {
+     messageId: text(record, 'messageId'),
+-    status: oneOf(record, 'status', ['processing', 'completed', 'failed', 'script-skip:error'] as const),
++    status: oneOf(record, 'status', ['processing', 'waiting_approval', 'completed', 'failed', 'script-skip:error'] as const),
+     statusChanged: timestamp(record, 'statusChanged'),
+   };
+ }
 diff --git a/src/mailbox/sqlite/index.ts b/src/mailbox/sqlite/index.ts
 index 5810720..8c81592 100644
 --- a/src/mailbox/sqlite/index.ts
@@ -1006,6 +1434,341 @@ index dbb546b..b7a38c4 100644
    getTerminalProcessingAcks(): ProcessingAck[];
    getProcessingClaims(): ProcessingClaim[];
    deleteOrphanProcessingClaims(): number;
+diff --git a/src/modules/approvals/finalize.ts b/src/modules/approvals/finalize.ts
+index c2a77c0..5d40cbd 100644
+--- a/src/modules/approvals/finalize.ts
++++ b/src/modules/approvals/finalize.ts
+@@ -1,3 +1,4 @@
++import { queueApprovalOutcome, reconcileApprovals } from './recovery.js';
+ /**
+  * Shared "finalize a rejected approval" path.
+  *
+@@ -10,10 +11,8 @@
+  * Kept in its own leaf file so both response-handler.ts and reason-capture.ts
+  * can import it without an import cycle (finalize → primitive only).
+  */
+-import { requestWake } from '../../request-wake.js';
+ import { deletePendingApproval, transitionPendingApprovalStatus } from '../../db/sessions.js';
+ import { log } from '../../log.js';
+-import { writeSessionMessage } from '../../session-manager.js';
+ import type { PendingApproval, Session } from '../../types.js';
+ import { notifyApprovalResolved } from './primitive.js';
+ 
+@@ -32,22 +31,19 @@ export async function finalizeReject(
+   userId: string,
+   reason?: string,
+   expectedStatus: 'pending' | 'awaiting_reason' = approval.status === 'awaiting_reason' ? 'awaiting_reason' : 'pending',
++  selectedOption = approval.decision_value ?? 'reject',
+ ): Promise<boolean> {
+-  if (!(await transitionPendingApprovalStatus(approval.approval_id, expectedStatus, 'rejected'))) return false;
++  if (
++    !(await transitionPendingApprovalStatus(approval.approval_id, expectedStatus, 'rejected', {
++      userId: userId || approval.decided_by || undefined,
++      comment: reason,
++      value: selectedOption,
++    }))
++  )
++    return false;
+ 
+-  const text = reason
+-    ? `Your ${approval.action} request was rejected by admin: "${reason}"`
+-    : `Your ${approval.action} request was rejected by admin.`;
+-
+-  await writeSessionMessage(session.agent_group_id, session.id, {
+-    id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+-    kind: 'chat',
+-    timestamp: new Date().toISOString(),
+-    platformId: session.agent_group_id,
+-    channelType: 'agent',
+-    threadId: null,
+-    content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
+-  });
++  await queueApprovalOutcome(approval.approval_id);
++  await reconcileApprovals();
+ 
+   log.info('Approval rejected', {
+     approvalId: approval.approval_id,
+@@ -58,6 +54,6 @@ export async function finalizeReject(
+ 
+   await deletePendingApproval(approval.approval_id);
+   await notifyApprovalResolved({ approval, session, outcome: 'reject', userId });
+-  await requestWake(session, 'approval-response');
++
+   return true;
+ }
+diff --git a/src/modules/approvals/index.ts b/src/modules/approvals/index.ts
+index 33ca726..341b84c 100644
+--- a/src/modules/approvals/index.ts
++++ b/src/modules/approvals/index.ts
+@@ -1,3 +1,4 @@
++import './recovery.js';
+ /**
+  * Approvals module — admin approval primitive + response plumbing.
+  *
+diff --git a/src/modules/approvals/primitive.ts b/src/modules/approvals/primitive.ts
+index a87e937..0f44980 100644
+--- a/src/modules/approvals/primitive.ts
++++ b/src/modules/approvals/primitive.ts
+@@ -1,3 +1,4 @@
++import { approvalDeadline } from './deadlines.js';
+ /**
+  * Approvals primitive — the public API that other modules call.
+  *
+@@ -219,6 +220,10 @@ export async function notifyAgent(session: Session, text: string): Promise<void>
+ }
+ 
+ export interface RequestApprovalOptions {
++  onCreated?: (id:string)=>Promise<void>;
++  options?: RawOption[];
++  expiresAt?: string;
++  requestId?: string;
+   session: Session;
+   agentName: string;
+   /** Free-form action identifier. Must match the key the consumer registered via registerApprovalHandler. */
+@@ -264,11 +269,13 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
+     return;
+   }
+ 
+-  const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+-  const normalizedOptions = normalizeOptions(APPROVAL_OPTIONS);
++  const approvalId = opts.requestId ?? `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
++  const normalizedOptions = normalizeOptions(opts.options ?? APPROVAL_OPTIONS);
+   await createPendingApproval({
+     approval_id: approvalId,
++    expires_at: approvalDeadline(new Date().toISOString(), opts.expiresAt),
+     session_id: session.id,
++    agent_group_id:session.agent_group_id,
+     request_id: approvalId,
+     action,
+     payload: JSON.stringify(payload),
+@@ -284,6 +291,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
+     approver_user_id: approverUserId ?? target.userId ?? null,
+   });
+ 
++  await opts.onCreated?.(approvalId);
+   const adapter = getDeliveryAdapter();
+   if (adapter) {
+     try {
+@@ -297,7 +305,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
+           questionId: approvalId,
+           title,
+           question,
+-          options: APPROVAL_OPTIONS,
++          options: opts.options ?? APPROVAL_OPTIONS,
+         }),
+         undefined,
+         target.messagingGroup.instance,
+@@ -307,6 +315,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
+       // The single delivery target never saw the card — remove the row so it
+       // can't linger as a pending approval nobody can act on.
+       await deletePendingApproval(approvalId);
++      await (await import('./recovery.js')).queueApprovalOutcome(approvalId);
+       // A card the channel refused as too long says why, so the agent can shorten it.
+       const reason =
+         err instanceof CardTooLongError
+diff --git a/src/modules/approvals/reason-capture.test.ts b/src/modules/approvals/reason-capture.test.ts
+index bca5e58..c5eb143 100644
+--- a/src/modules/approvals/reason-capture.test.ts
++++ b/src/modules/approvals/reason-capture.test.ts
+@@ -1,3 +1,4 @@
++import {getDb} from '../../db/connection.js';
+ /**
+  * "Reject with reason…" capture flow.
+  *
+@@ -36,7 +37,7 @@ vi.mock('../../container-runner.js', () => ({
+ 
+ vi.mock('../../config.js', async () => {
+   const actual = await vi.importActual('../../config.js');
+-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-reject-reason' };
++  return { ...actual, DATA_DIR: process.cwd()+'/.cache/nanoclaw-test-reject-reason' };
+ });
+ 
+ vi.mock('../../session-manager.js', async () => {
+@@ -44,7 +45,7 @@ vi.mock('../../session-manager.js', async () => {
+   return { ...actual, writeSessionMessage: vi.fn() };
+ });
+ 
+-const TEST_DIR = '/tmp/nanoclaw-test-reject-reason';
++const TEST_DIR = process.cwd()+'/.cache/nanoclaw-test-reject-reason';
+ const DM_CHANNEL = 'slack';
+ const DM_PLATFORM = 'D-admin-1';
+ const DM_INSTANCE = 'slack-secondary';
+@@ -161,7 +162,7 @@ describe('reject with reason', () => {
+ 
+     const row = await getPendingApproval('appr-1');
+     expect(row?.status).toBe('awaiting_reason');
+-    expect(row?.expires_at).toBeTruthy();
++    expect((await getDb().get<any>('SELECT reason_deadline_at FROM pending_approvals WHERE approval_id=?','appr-1'))?.reason_deadline_at).toBeTruthy();
+ 
+     // Prompt went to the admin's resolved DM, not the (empty) click platformId.
+     expect(delivered).toHaveLength(1);
+@@ -184,7 +185,7 @@ describe('reject with reason', () => {
+ 
+     expect(consumed).toBe(true);
+     expect(await getPendingApproval('appr-2')).toBeUndefined();
+-    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin: "too risky for prod"');
++    expect(lastRelayedText()).toContain('Your install_packages request was rejected by admin: "too risky for prod"');
+   });
+ 
+   it('truncates an over-long reason to 280 chars with an ellipsis', async () => {
+@@ -194,7 +195,7 @@ describe('reject with reason', () => {
+ 
+     await captureReasonReply(dmReply('x'.repeat(400)));
+ 
+-    const reason = lastRelayedText()!.match(/: "(.*)"$/)![1];
++    const reason = lastRelayedText()!.match(/: "([^"]*)"/)![1];
+     expect(reason).toHaveLength(280);
+     expect(reason.endsWith('…')).toBe(true);
+   });
+@@ -208,7 +209,7 @@ describe('reject with reason', () => {
+ 
+     expect(consumed).toBe(true);
+     expect(await getPendingApproval('appr-4')).toBeUndefined();
+-    expect(lastRelayedText()).toBe('Your create_agent request was rejected by admin.');
++    expect(lastRelayedText()).toContain('Your create_agent request was rejected by admin.');
+   });
+ 
+   it('does not swallow a later DM once the hold was already finalized', async () => {
+@@ -264,7 +265,7 @@ describe('reject with reason', () => {
+     expect(delivered[0].threadId).toBe('thread-1');
+ 
+     expect(await captureReasonReply(dmReply('not now', 'thread-1'))).toBe(true);
+-    expect(lastRelayedText()).toBe('Your create_agent request was rejected by admin: "not now"');
++    expect(lastRelayedText()).toContain('Your create_agent request was rejected by admin: "not now"');
+   });
+ 
+   it('ignores DMs on channels with no armed reason capture', async () => {
+@@ -288,7 +289,7 @@ describe('reject-with-reason host sweep', () => {
+     await sweepAwaitingReasonRejects();
+ 
+     expect(await getPendingApproval('appr-ghost')).toBeUndefined();
+-    expect(lastRelayedText()).toBe('Your add_mcp_server request was rejected by admin.');
++    expect(lastRelayedText()).toContain('Your add_mcp_server request was rejected by admin.');
+   });
+ 
+   it('leaves a still-open hold untouched', async () => {
+@@ -319,6 +320,6 @@ describe('plain reject (regression)', () => {
+ 
+     expect(await getPendingApproval('appr-plain')).toBeUndefined();
+     expect(delivered).toHaveLength(0);
+-    expect(lastRelayedText()).toBe('Your install_packages request was rejected by admin.');
++    expect(lastRelayedText()).toContain('Your install_packages request was rejected by admin.');
+   });
+ });
+diff --git a/src/modules/approvals/reason-capture.ts b/src/modules/approvals/reason-capture.ts
+index 67235c6..a20814d 100644
+--- a/src/modules/approvals/reason-capture.ts
++++ b/src/modules/approvals/reason-capture.ts
+@@ -85,7 +85,7 @@ function extractText(event: InboundEvent): string {
+  */
+ export async function armReasonCapture(approval: PendingApproval, session: Session, userId: string): Promise<void> {
+   const expiresAt = new Date(Date.now() + REASON_CAPTURE_WINDOW_MS).toISOString();
+-  if (!(await markApprovalAwaitingReason(approval.approval_id, expiresAt))) return;
++  if (!(await markApprovalAwaitingReason(approval.approval_id, expiresAt, userId))) return;
+ 
+   const channelType = approval.channel_type;
+   const platformId = approval.platform_id;
+diff --git a/src/modules/approvals/response-handler.ts b/src/modules/approvals/response-handler.ts
+index 066eb02..aae78fc 100644
+--- a/src/modules/approvals/response-handler.ts
++++ b/src/modules/approvals/response-handler.ts
+@@ -1,3 +1,5 @@
++import { applicationResult } from './lifecycle.js';
++import { queueApprovalOutcome } from './recovery.js';
+ /**
+  * Handle an admin's response to an approval card.
+  *
+@@ -43,7 +45,7 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
+     return true;
+   }
+ 
+-  await handleRegisteredApproval(approval, payload.value, namespacedUserId(payload) ?? '');
++  await handleRegisteredApproval(approval, payload.value, namespacedUserId(payload) ?? '', payload.comment);
+   return true;
+ }
+ 
+@@ -51,7 +53,22 @@ async function handleRegisteredApproval(
+   approval: PendingApproval,
+   selectedOption: string,
+   userId: string,
++  comment?: string,
+ ): Promise<void> {
++  if (approval.status !== 'pending' && approval.status !== 'awaiting_reason') return;
++  if (approval.status === 'pending' && approval.expires_at && Date.parse(approval.expires_at) <= Date.now()) {
++    await transitionPendingApprovalStatus(approval.approval_id, 'pending', 'expired');
++    await queueApprovalOutcome(approval.approval_id);
++    await deletePendingApproval(approval.approval_id);
++    return;
++  }
++  const choices = JSON.parse(approval.options_json || '[]');
++  if (
++    choices.length
++      ? !choices.some((o: any) => (typeof o === 'string' ? o : (o.value ?? o.label)) === selectedOption)
++      : !['approve', 'reject', REJECT_WITH_REASON_VALUE].includes(selectedOption)
++  )
++    return;
+   if (!approval.session_id) {
+     await deletePendingApproval(approval.approval_id);
+     return;
+@@ -65,6 +82,10 @@ async function handleRegisteredApproval(
+   // "Reject with reason…" — hold the row and capture the admin's next DM
+   // instead of finalizing now. The agent is notified exactly once: after the
+   // reason arrives, or after the sweep's timeout if the admin ghosts.
++  if (selectedOption === REJECT_WITH_REASON_VALUE && comment?.trim()) {
++    await finalizeReject(approval, session, userId, comment, undefined, selectedOption);
++    return;
++  }
+   if (selectedOption === REJECT_WITH_REASON_VALUE) {
+     await armReasonCapture(approval, session, userId);
+     return;
+@@ -72,11 +93,18 @@ async function handleRegisteredApproval(
+ 
+   // Plain Reject (or any other non-approve value) — instant fast path.
+   if (selectedOption !== 'approve') {
+-    await finalizeReject(approval, session, userId);
++    await finalizeReject(approval, session, userId, comment, undefined, selectedOption);
+     return;
+   }
+ 
+-  if (!(await transitionPendingApprovalStatus(approval.approval_id, 'pending', 'approved'))) return;
++  if (
++    !(await transitionPendingApprovalStatus(approval.approval_id, 'pending', 'approved', {
++      userId,
++      comment,
++      value: selectedOption,
++    }))
++  )
++    return;
+ 
+   // Approved — dispatch to the module that registered for this action.
+   const notify = (text: string): Promise<void> =>
+@@ -96,6 +124,7 @@ async function handleRegisteredApproval(
+       approvalId: approval.approval_id,
+       action: approval.action,
+     });
++    await applicationResult(approval.approval_id, 'failed', 'No handler is installed to apply this action');
+     await notify(`Your ${approval.action} was approved, but no handler is installed to apply it.`);
+     await deletePendingApproval(approval.approval_id);
+     await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
+@@ -106,14 +135,17 @@ async function handleRegisteredApproval(
+   const payload = JSON.parse(approval.payload);
+   try {
+     await handler({ session, payload, approval, userId, notify });
++    await applicationResult(approval.approval_id, 'applied');
+     log.info('Approval handled', { approvalId: approval.approval_id, action: approval.action, userId });
+   } catch (err) {
++    await applicationResult(approval.approval_id, 'uncertain', err instanceof Error ? err.message : String(err));
+     log.error('Approval handler threw', { approvalId: approval.approval_id, action: approval.action, err });
+     await notify(
+-      `Your ${approval.action} was approved, but applying it failed: ${err instanceof Error ? err.message : String(err)}.`,
++      `Your ${approval.action} was approved, but application could not be verified. Inspect the recorded state before repeating the operation.`,
+     );
+   }
+ 
++  await queueApprovalOutcome(approval.approval_id);
+   await deletePendingApproval(approval.approval_id);
+   await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
+   await requestWake(session, 'approval-response');
 diff --git a/src/modules/community-portal/registration.test.ts b/src/modules/community-portal/registration.test.ts
 index 2de19b4..33ac466 100644
 --- a/src/modules/community-portal/registration.test.ts
@@ -1071,10 +1834,18 @@ index 3549d76..1aa0e72 100644
    const allowlist = loadMountAllowlist();
  
 diff --git a/src/response-registry.ts b/src/response-registry.ts
-index 51fbd58..fe064b3 100644
+index 51fbd58..9254abe 100644
 --- a/src/response-registry.ts
 +++ b/src/response-registry.ts
-@@ -35,3 +35,11 @@ export function registerResponseHandler(handler: ResponseHandler, options: { pre
+@@ -14,6 +14,7 @@
+ 
+ export interface ResponsePayload {
+   questionId: string;
++  comment?: string;
+   instance?: string;
+   messageId?: string;
+   value: string;
+@@ -35,3 +36,11 @@ export function registerResponseHandler(handler: ResponseHandler, options: { pre
  export function getResponseHandlers(): readonly ResponseHandler[] {
    return responseHandlers;
  }
@@ -1130,7 +1901,7 @@ index 35fc116..c8f147a 100644
 +  return { queued, duplicate: false };
 +}
 diff --git a/src/session-manager.ts b/src/session-manager.ts
-index ad84b64..b9fb29d 100644
+index ad84b64..dc1caa1 100644
 --- a/src/session-manager.ts
 +++ b/src/session-manager.ts
 @@ -6,6 +6,7 @@ import { AsyncLocalStorage } from 'async_hooks';
@@ -1141,7 +1912,16 @@ index ad84b64..b9fb29d 100644
  import { AnchoredDir } from './anchored-dir.js';
  import { deriveAttachmentName } from './attachment-naming.js';
  import { inboxFolderName, isSafeAttachmentName } from './attachment-safety.js';
-@@ -311,8 +312,11 @@ export async function writeSessionMessage(
+@@ -299,6 +300,8 @@ export async function writeSessionMessage(
+      * Dying containers (past first poll) skip these rows.
+      */
+     onWake?: boolean;
++    /** Durable outbox retries may repeat an identical message ID and payload. */
++    idempotent?: boolean;
+   },
+ ): Promise<void> {
+   // Documented reset: operators `rm -rf` a session folder to clear a stuck
+@@ -311,8 +314,20 @@ export async function writeSessionMessage(
  
    // Extract base64 attachment data, save to inbox, replace with file paths
    const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
@@ -1150,10 +1930,19 @@ index ad84b64..b9fb29d 100644
 +  // Lock the runtime before mail becomes visible to any runner or sweep.
    await withMailboxSession(agentGroupId, sessionId, async (mailbox) => {
 +    if (workspaceContext !== undefined) mailbox.setWorkspaceContext?.(workspaceContext);
++    if (message.idempotent) {
++      if (!mailbox.getWorkspaceMessage) throw new Error('Mailbox does not support idempotent outbox delivery');
++      const existing = mailbox.getWorkspaceMessage(message.id);
++      if (existing) {
++        if (existing.content !== content || existing.kind !== message.kind)
++          throw new Error('Outbox message identity was reused with different content');
++        return;
++      }
++    }
      await mailbox.insertMessage({
        id: message.id,
        kind: message.kind,
-@@ -328,6 +332,8 @@ export async function writeSessionMessage(
+@@ -328,6 +343,8 @@ export async function writeSessionMessage(
        onWake: message.onWake ?? false,
      });
    });
@@ -1162,6 +1951,76 @@ index ad84b64..b9fb29d 100644
    await updateSession(sessionId, { last_active: new Date().toISOString() });
    // Ask for a prompt reconcile now that the message is durable: a wake that
    // fails transiently is retried within the queue's cadence instead of
+@@ -389,17 +400,40 @@ function extractAttachmentFiles(
+   // message whose attachments have no inline `data` never creates an inbox dir.
+   let inbox: AnchoredDir | null | undefined;
+ 
++  // Reserve every supplied name before generating suffixes, including names
++  // already staged on disk. Case/Unicode folding avoids collisions on macOS.
++  const nameKey = (name: string) => name.normalize('NFC').toLowerCase();
++  const names = attachments.map((att, index) => {
++    const name = deriveAttachmentName(att);
++    return isSafeAttachmentName(name) ? name : `attachment-${index + 1}`;
++  });
++  const reserved = new Set(names.map(nameKey));
++  const used = new Set<string>();
++
+   let changed = false;
+   try {
+-    for (const att of attachments) {
++    for (const [index, att] of attachments.entries()) {
++      const rawName = names[index];
++      let filename = rawName;
++      if (used.has(nameKey(filename))) {
++        const extension = path.extname(rawName);
++        // Leave room for the suffix within the filesystem's 255-byte limit.
++        const ext = Buffer.byteLength(extension) <= 200 ? extension : '';
++        for (let suffix = 2; ; suffix++) {
++          const ending = ` (${suffix})${ext}`;
++          const stem = Array.from(rawName.slice(0, rawName.length - ext.length));
++          while (Buffer.byteLength(stem.join('') + ending) > 255) stem.pop();
++          filename = stem.join('') + ending;
++          if (!reserved.has(nameKey(filename)) && !used.has(nameKey(filename))) break;
++        }
++      }
++      used.add(nameKey(filename));
+       if (typeof att.data !== 'string') continue;
+ 
+-      const rawName = deriveAttachmentName(att);
+-      const filename = isSafeAttachmentName(rawName) ? rawName : `attachment-${Date.now()}`;
+-      if (filename !== rawName) {
++      if (!isSafeAttachmentName(deriveAttachmentName(att))) {
+         log.warn('Refused unsafe attachment filename, would escape inbox', {
+           messageId,
+-          rawName,
++          rawName: att.name,
+           replacement: filename,
+         });
+       }
+diff --git a/src/types.ts b/src/types.ts
+index ade18b1..19a3079 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -225,10 +225,18 @@ export interface PendingQuestion {
+ // ── Pending approvals (central DB) ──
+ 
+ /** Every status a pending_approvals row can hold. */
+-export const PENDING_APPROVAL_STATUSES = ['pending', 'approved', 'rejected', 'expired', 'awaiting_reason'] as const;
++export const PENDING_APPROVAL_STATUSES = ['pending', 'approved', 'rejected', 'expired', 'awaiting_reason', 'cancelled'] as const;
+ export type PendingApprovalStatus = (typeof PENDING_APPROVAL_STATUSES)[number];
+ 
+ export interface PendingApproval {
++  archived_at?: string|null;
++  decision_comment?: string|null;
++  decision_value?: string|null;
++  application_error?: string|null;
++  decided_by?: string|null;
++  decided_at?: string|null;
++  application_state?: 'not_started'|'applying'|'applied'|'failed'|'uncertain';
++  reason_deadline_at?:string|null;
+   approval_id: string;
+   session_id: string | null;
+   request_id: string;
 diff --git a/vitest.config.ts b/vitest.config.ts
 index 2f8eea8..99cdada 100644
 --- a/vitest.config.ts
@@ -1174,3 +2033,47 @@ index 2f8eea8..99cdada 100644
        'setup/**/*.test.ts',
        'scripts/**/*.test.ts',
        'container/*.test.ts',
+diff --git a/src/host-lifecycle.ts b/src/host-lifecycle.ts
+--- a/src/host-lifecycle.ts
++++ b/src/host-lifecycle.ts
+@@ -68,3 +68,20 @@
+ export async function stopHostModules(): Promise<void> {
+   await runShutdownCallbacks([...shutdownCallbacks].reverse());
+ }
++
++export interface RuntimeEnded {
++  sessionId: string;
++  incarnation?: number;
++  reason: string;
++  timestamp: string;
++}
++const runtimeEndCallbacks = new Set<(event: RuntimeEnded) => Promise<void>>();
++export function onRuntimeEnded(callback: (event: RuntimeEnded) => Promise<void>): void {
++  runtimeEndCallbacks.add(callback);
++}
++export async function publishRuntimeEnded(event: RuntimeEnded): Promise<void> {
++  for (const callback of runtimeEndCallbacks) {
++    try { await callback(event); }
++    catch (error) { log.error('Runtime end observer failed', {sessionId:event.sessionId,error}); }
++  }
++}
+
+diff --git a/src/anchored-dir.ts b/src/anchored-dir.ts
+index c99cb60f..ca07b7ff 100644
+--- a/src/anchored-dir.ts
++++ b/src/anchored-dir.ts
+@@ -153,12 +153,13 @@ export class AnchoredDir {
+    * this directory, so readers never see a partial file and a symlink planted
+    * under `name` is replaced, never followed.
+    */
+-  replaceFile(name: string, data: string | Uint8Array): void {
++  replaceFile(name: string, data: string | Uint8Array, mode?: number): void {
+     const tmp = `${name}.tmp-${process.pid}-${Date.now()}`;
+     let fd: number | undefined = this.openNewFd(tmp);
+     let renamed = false;
+     try {
+       fs.writeFileSync(fd, data);
++      if (mode !== undefined) fs.fchmodSync(fd, mode & 0o777);
+       // close(2) releases the descriptor even when it reports an error, so it is
+       // forgotten before the call: a second close could hit a reused number.
+       const written = fd;

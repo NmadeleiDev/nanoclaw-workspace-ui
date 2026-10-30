@@ -84,3 +84,131 @@ it('pins a late terminal block after its answer even when a new user message has
  expect(messageGroups([first,user,block]).flat().map(m=>m.id)).toEqual(['a','tools','u']);
  expect(activitySources([block],{running:false,startedAt:'01',tools:{x:{name:'Bash'}}})).toHaveLength(1);
 });
+
+const archived = (state: typeof finished, id = 'saved-turn') => ({
+ id,sessionId:'chat',role:'tool' as const,kind:'activity',text:'',files:[],timestamp:'2026-10-28T00:00:10.000Z',source:'agent',
+ data:{activityKey:liveActivityKey(state),startedAt:state.startedAt,endedAt:'2026-10-28T00:00:10.000Z',tools:Object.values(state.tools)},
+});
+it('uses identical evidence for a completed live turn and its archived tools',()=>{
+ expect(activitySources([archived(finished)],null)[0].evidence).toBe(activitySources([],finished)[0].evidence);
+});
+it('keeps a generated summary after archiving and advancing to a new turn, without generating it again',async()=>{
+ await saveLive(finished);
+ const run=vi.spyOn(service.models,'run').mockResolvedValue('Verified all eight tests pass.');
+ await service.activitySummaries('chat');await ready();await service.work();
+ await store.putMessage(archived(finished));
+ await saveLive({...finished,running:true,startedAt:'2026-10-28T00:01:00.000Z',tools:{}});
+ expect((await service.activitySummaries('chat'))[liveActivityKey(finished)]).toMatchObject({text:'Verified all eight tests pass.',count:1});
+ expect(run).toHaveBeenCalledOnce();
+});
+it('restores summaries saved with the archived wrapper, but rejects changed tool evidence',async()=>{
+ const block=archived(finished);await store.putMessage(block);await saveLive({...finished,running:true});
+ const evidence=JSON.stringify({tool:'tool',text:'',calls:[{name:'Bash',input:'pnpm test',status:'completed',output:'8 tests passed',error:''}]});
+ const {createHash}=await import('node:crypto');const hash=createHash('sha256').update(evidence).digest('hex');
+ await store.db.run('INSERT INTO ws_activity_summaries (id,session_id,group_key,source_key,evidence,summary,updated_at) VALUES (?,?,?,?,?,?,?)','legacy','chat',liveActivityKey(finished),hash,evidence,'Verified all eight tests pass.',new Date().toISOString());
+ expect((await service.activitySummaries('chat'))[liveActivityKey(finished)]).toMatchObject({text:'Verified all eight tests pass.',count:1});
+ await store.db.run('UPDATE ws_messages SET data=? WHERE id=?',JSON.stringify({...block.data,tools:[{...finished.tools.a,output:'Tests failed'}]}),block.id);
+ expect((await service.activitySummaries('chat'))[liveActivityKey(finished)]).toBeUndefined();
+});
+
+it('reuses a completed archive-envelope cache entry without queuing fresh inference',async()=>{
+ const block=archived(finished);await store.putMessage(block);await saveLive(finished);
+ const {createHash}=await import('node:crypto');
+ const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
+ const key=liveActivityKey(finished);const id=hash(`chat:${key}`);
+ const evidence=JSON.stringify({tool:'tool',text:'',calls:[{name:'Bash',input:'pnpm test',status:'completed',output:'8 tests passed',error:''}]});
+ await store.db.run('INSERT INTO ws_activity_summaries (id,session_id,group_key,source_key,evidence,summary,updated_at) VALUES (?,?,?,?,?,?,?)',id,'chat',key,hash(evidence),evidence,'Verified all eight tests pass.',new Date().toISOString());
+ await service.enqueue(id,'activity-summary',hash(evidence),0);
+ await store.db.run("UPDATE ws_utility_jobs SET state='completed' WHERE scope_id=?",id);
+ const run=vi.spyOn(service.models,'run');
+ expect((await service.activitySummaries('chat'))[key]).toMatchObject({text:'Verified all eight tests pass.',state:'completed',count:1});
+ await ready();await service.work();expect(run).not.toHaveBeenCalled();
+});
+it('persists the latest context snapshot across turns and replaces it after compaction',async()=>{
+ const apply=(rows:any[]) => (service as any).applyEvents('chat',rows.map((row,index)=>({seq:index+1,timestamp:new Date().toISOString(),content:JSON.stringify(row.data??{}),kind:row.kind})));
+ await apply([{kind:'usage',data:{usedTokens:800,contextWindow:1000,model:'example'}}]);
+ await apply([{kind:'turn-start'},{kind:'turn-result'}]);
+ expect((await service.live('chat')).usage.usedTokens).toBe(800);
+ await apply([{kind:'usage',data:{usedTokens:100,contextWindow:1000,model:'example'}}]);
+ expect((await new WorkspaceService(store).live('chat')).usage.usedTokens).toBe(100);
+ await apply([{kind:'usage',data:{usedTokens:-1,contextWindow:1000}}]);
+ expect((await service.live('chat')).usage.usedTokens).toBe(100);
+ await apply([{kind:'usage',data:{reset:true}}]);
+ expect((await service.live('chat')).usage).toBeUndefined();
+});
+
+it.each(['turn-result','turn-cancelled'])('shows compaction as working until %s',async terminal=>{
+ const apply=(kind:string,data:object={})=>(service as any).applyEvents('chat',[{seq:1,timestamp:new Date().toISOString(),kind,content:JSON.stringify(data)}]);
+ await apply('turn-start');
+ expect((await service.live('chat')).running).toBe(true);
+ expect((await new WorkspaceService(store).live('chat')).running).toBe(true);
+ await apply(terminal,{isError:terminal==='turn-result'});
+ expect((await service.live('chat')).running).toBe(false);
+});
+
+it('summarizes each consecutive timeline tool group without including reasoning and supports retries by group key',async()=>{
+ const state={...finished,timeline:[
+  {id:'r',kind:'reasoning',text:'Private reasoning must stay out of utility summaries'},
+  {id:'t1',kind:'tool',name:'Read',status:'completed',output:'file read'},
+  {id:'t2',kind:'tool',name:'Search',status:'completed',output:'match found'},
+  {id:'a',kind:'text',text:'Checking the next step'},
+  {id:'t3',kind:'tool',name:'Test',status:'completed',output:'passed'},
+ ]};
+ await saveLive(state);
+ const run=vi.spyOn(service.models,'run').mockResolvedValue('Verified the tools completed.');
+ await service.activitySummaries('chat');await ready();await service.work();await service.work();
+ const sources=activitySources([],state).filter(s=>s.turnKey);
+ expect(sources.map(s=>s.count)).toEqual([2,1]);
+ expect(run).toHaveBeenCalledTimes(2);
+ expect(run.mock.calls.every(call=>!call[1].text.includes('Private reasoning'))).toBe(true);
+ let summaries=await service.activitySummaries('chat');
+ for(const source of sources)expect(summaries[source.key]).toMatchObject({text:'Verified the tools completed.',state:'completed',count:source.count});
+ // Persisted turns use the same keys and evidence as live output.
+ await store.putMessage({id:`chat:${liveActivityKey(state)}`,sessionId:'chat',role:'tool',kind:'activity',text:'',files:[],timestamp:new Date().toISOString(),source:'agent',data:{activityKey:liveActivityKey(state),timeline:state.timeline,tools:Object.values(state.tools)}});
+ await store.saveSettings({automaticSummaries:false});
+ await service.summarizeActivity('chat',sources[0].key);
+ summaries=await service.activitySummaries('chat');
+ expect(summaries[sources[0].key].text).toBe('Verified the tools completed.');
+});
+it('summarizes tools across reasoning traces as one work block without including the reasoning',()=>{
+ const state={...finished,timeline:[
+  {id:'r1',kind:'reasoning',text:'private thought one'},
+  {id:'t1',kind:'tool',name:'Read',output:'read file'},
+  {id:'r2',kind:'reasoning',text:'private thought two'},
+  {id:'t2',kind:'tool',name:'Search',output:'found match'},
+ ]};
+ const sources=activitySources([],state).filter(s=>s.turnKey);
+ expect(sources).toHaveLength(1);expect(sources[0].count).toBe(2);
+ expect(sources[0].key).toBe(`${liveActivityKey(state)}:tools:t1`);
+ expect(sources[0].evidence).toContain('Read');expect(sources[0].evidence).toContain('Search');
+ expect(sources[0].evidence).not.toContain('private thought');
+});
+
+
+it.each([true, false])('queues completed turns before an immediate next turn (automatic summaries: %s)',async automaticSummaries=>{
+ await store.saveSettings({automaticSummaries});
+ const events = [
+  {kind:'turn-start',timestamp:'2026-10-29T14:51:50.909Z',content:{}},
+  {kind:'tool',timestamp:'2026-10-29T14:52:00.000Z',content:{id:'first',name:'Read',status:'completed',output:'First turn evidence'}},
+  {kind:'text-delta',timestamp:'2026-10-29T14:52:01.000Z',content:{id:'reply',text:'Checking another step'}},
+  {kind:'tool',timestamp:'2026-10-29T14:52:02.000Z',content:{id:'second',name:'Test',status:'completed',output:'Second block evidence'}},
+  {kind:'turn-result',timestamp:'2026-10-29T14:58:15.561Z',content:{}},
+  {kind:'turn-finished',timestamp:'2026-10-29T14:58:15.564Z',content:{}},
+  {kind:'turn-start',timestamp:'2026-10-29T14:58:15.564Z',content:{}},
+ ].map((event,index)=>({...event,seq:index+1,content:JSON.stringify(event.content)}));
+ await (service as any).archiveActivity('chat',events);
+ await (service as any).applyEvents('chat',events);
+ expect((await service.live('chat')).running).toBe(true);
+ const jobs=await store.db.all<any>("SELECT * FROM ws_utility_jobs WHERE task='activity-summary'");
+ expect(jobs).toHaveLength(automaticSummaries ? 2 : 0);
+ if (!automaticSummaries) return;
+ // Replayed terminal events reuse the same durable jobs.
+ await (service as any).archiveActivity('chat',events);
+ expect(await store.db.all("SELECT * FROM ws_utility_jobs WHERE task='activity-summary'")).toHaveLength(2);
+ const run=vi.spyOn(service.models,'run').mockResolvedValue('Verified completed tool activity.');
+ await ready();await service.work();await service.work();
+ expect(run).toHaveBeenCalledTimes(2);
+ const summaries=await service.activitySummaries('chat');
+ expect(Object.values(summaries)).toHaveLength(2);
+ for (const summary of Object.values(summaries)) expect(summary).toMatchObject({state:'completed',text:'Verified completed tool activity.'});
+});

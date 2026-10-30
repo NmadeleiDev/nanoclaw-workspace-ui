@@ -1,3 +1,4 @@
+import {parseApprovalComment} from '../approvals/deadlines.js';
 import { resolveProviderName } from '../../providers/provider-name.js';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -29,7 +30,7 @@ export interface WorkspaceBridge {
   cancel(session: WorkspaceSession): Promise<void>;
   reconfigure(session: WorkspaceSession): Promise<void>;
   prepareAgent?(agentId: string): Promise<void | (() => void)>;
-  respond(ownerId: string, id: string, value: string): Promise<void>;
+  respond(ownerId: string, id: string, value: string, comment?:string): Promise<void>;
   agentUtility?: AgentUtility;
 }
 
@@ -78,10 +79,11 @@ export function hostBridge(): WorkspaceBridge {
     },
     async cancel(session) {
       if (!session.nativeSessionId) throw new WorkspaceError(400, 'Imported conversations have no running turn.');
+      await (await import('../approvals/recovery.js')).cancelApprovalWait(session.nativeSessionId);
       await withMailboxSession(session.agentId, session.nativeSessionId, (box) => {
         if (!box.setWorkspaceControl)
           throw new WorkspaceError(501, 'The installed mailbox does not support workspace controls.');
-        box.setWorkspaceControl(JSON.stringify({ kind: 'cancel', at: new Date().toISOString() }));
+        box.setWorkspaceControl(JSON.stringify({ kind: 'cancel', approvalCancelled:true, at: new Date().toISOString() }));
       });
     },
     async reconfigure(session) {
@@ -140,7 +142,7 @@ export function hostBridge(): WorkspaceBridge {
         return pause.release;
       } catch(error) { pause.release();throw error; }
     },
-    async respond(ownerId, id, value) {
+    async respond(ownerId, id, value, comment) {
       const db = getDb();
       const approval = await db.get<any>('SELECT * FROM pending_approvals WHERE approval_id=?', id);
       const question = approval
@@ -152,6 +154,7 @@ export function hostBridge(): WorkspaceBridge {
       const row = approval ?? question;
       const payload = markOperatorResponse({
         questionId: id,
+        comment:parseApprovalComment(comment),
         value,
         userId: ownerId,
         channelType: 'workspace',

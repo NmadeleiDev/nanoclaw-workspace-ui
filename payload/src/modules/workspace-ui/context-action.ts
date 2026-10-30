@@ -1,3 +1,5 @@
+import {WorkspaceDocuments} from './documents.js';
+import {WorkspaceService} from './service.js';
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { getDb } from '../../db/connection.js';
@@ -61,3 +63,10 @@ registerDeliveryAction(
     'Only reads or revision-updates the calling session’s scratchpads and its explicitly linked reference history; no host paths, credentials, or cross-project targets are accepted.',
   ),
 );
+
+registerDeliveryAction('workspace_viewer',async(input,session)=>{
+ const requestId=String(input.requestId);if(!/^[a-f0-9-]{36}$/.test(requestId))throw new Error('Invalid workspace request id.');
+ let data:unknown,error:string|undefined;
+ try{const documents=new WorkspaceDocuments(new WorkspaceService(new WorkspaceStore(getDb())));data=await documents.present(session.id,requestId,String(input.operation),input);}catch(e){error=e instanceof Error?e.message:String(e);}
+ await writeSessionMessage(session.agent_group_id,session.id,{id:`workspace-response-${requestId}`,kind:'system',timestamp:new Date().toISOString(),content:JSON.stringify({type:'workspace_response',data,error})});
+},unguarded('Only presents documents within the calling session; no file writes or cross-session targets.'));

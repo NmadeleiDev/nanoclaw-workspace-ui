@@ -173,3 +173,25 @@ it('previews attachment-only messages, normalizes web senders and resolves times
   await store.putMessage({id:'later-empty',sessionId:'attachment-chat',role:'assistant',kind:'chat',text:' \n\t\r ',timestamp:'2026-01-01T00:01:00.000Z',source:'web',files:[]});
   expect((await service.bootstrap()).sessions.find(s=>s.id==='attachment-chat')?.latestMessage).toEqual({role:'user',text:'Attachment',sender:'You',timestamp});
 });
+
+it('archives full ordered output including reasoning on terminal events and replays idempotently',async()=>{
+ await store.addSession({id:'stream',agentId:'assistant'});
+ const rows=[
+  {kind:'turn-start',content:'{}'},
+  {kind:'text-delta',content:JSON.stringify({id:'r',partType:'reasoning',delta:'x'.repeat(120001)})},
+  {kind:'text-delta',content:JSON.stringify({id:'a',partType:'text',delta:'Checking'})},
+  {kind:'tool',content:JSON.stringify({id:'tool',name:'read',status:'completed'})},
+  {kind:'text-delta',content:JSON.stringify({id:'b',partType:'text',delta:'Done'})},
+  {kind:'turn-result',content:'{}'},
+ ].map((row,seq)=>({...row,seq,timestamp:`2026-10-29T00:00:0${seq}.000Z`}));
+ await (service as any).archiveActivity('stream',rows);
+ await (service as any).archiveActivity('stream',rows);
+ const result=await store.history('stream');
+ expect(result.messages).toHaveLength(1);
+ expect((result.messages[0].data?.timeline as any[]).map((e:any)=>e.id)).toEqual(['r','a','tool','b']);
+ expect((result.messages[0].data?.timeline as any[])[0].text).toHaveLength(120001);
+ await (service as any).applyEvents('stream',rows);
+ const live=await service.live('stream');
+ expect(live.running).toBe(false);
+ expect(live.timeline).toEqual(result.messages[0].data?.timeline);
+});

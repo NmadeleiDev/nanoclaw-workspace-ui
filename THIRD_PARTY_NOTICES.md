@@ -10,3 +10,5 @@ The visual work credits these public design references and adaptations:
 - Chánh Đại / ncdai: [Theme Switcher](https://21st.dev/@ncdai/components/theme-switcher-1), with [original component page](https://chanhdai.com/components/theme-switcher-component).
 
 The frontend uses its own system-CSS controls, application-specific tokens and bounded ambient rendering rather than installing those catalog components as dependencies. Original authorship is retained in source comments. These credits do not relicense third-party work. No commercial component kit or remotely fetched runtime code is bundled.
+
+PDF previews use Mozilla PDF.js (`pdfjs-dist` 6.4.299), licensed under Apache-2.0. Its worker and display code are bundled locally. See https://github.com/mozilla/pdf.js/blob/master/LICENSE .

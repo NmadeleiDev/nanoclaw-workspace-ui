@@ -26,6 +26,8 @@ export async function workspaceResponse<T>(response: Response): Promise<T> {
     throw new Error(`Could not read the workspace response (HTTP ${response.status}). Reload the app or check the host.`);
   }
   if (!response.ok) {
+    if (response.status === 503 && value && typeof value === 'object' && 'code' in value && value.code === 'workspace_access_paused')
+      throw new WorkspaceConnectionError('Remote workspace access is paused. Reconnecting to the private host…', 503, true);
     const error = value && typeof value === 'object' && 'error' in value ? value.error : null;
     throw new Error(typeof error === 'string' && error ? error : `Workspace request failed (HTTP ${response.status}).`);
   }

@@ -44,7 +44,7 @@ beforeEach(async () => {
     'agent',
     'system:workspace:s',
     'active',
-    'stopped',
+    'running',
     new Date().toISOString(),
   );
   await store.addSession({ id: 's', nativeSessionId: 's', agentId: 'agent' });
@@ -106,7 +106,7 @@ it('records a failure without raw diagnostics or requiring a chat message', asyn
   });
 });
 
-it('retains completed native turns across new turns and pins them after their assistant replies', async () => {
+it('retains completed turns in timeline order across new turns', async () => {
   const time=(n:number)=>`2026-10-28T01:00:${String(n).padStart(2,'0')}.000Z`;
   const event=(seq:number,kind:string,data:any={})=>({seq,kind,timestamp:time(seq),content:JSON.stringify(data)});
   fake.events=[event(1,'turn-start'),event(2,'tool',{id:'t1',name:'Bash',status:'completed',input:'test',output:'passed'}),event(4,'turn-result')];
@@ -116,12 +116,12 @@ it('retains completed native turns across new turns and pins them after their as
   expect(await service.live('s')).toMatchObject({running:false,archived:true});
   await store.putMessage({id:'u2',sessionId:'s',role:'user',kind:'chat',text:'Next question',timestamp:time(5),source:'web',files:[]});
   let history=(await store.history('s')).messages;
-  expect(messageGroups(history).flat().map(m=>m.data?.activityKey?'activity':m.id)).toEqual(['s:out:a1','activity','u2']);
+  expect(messageGroups(history).flat().map(m=>m.data?.activityKey?'activity':m.id)).toEqual(['activity','s:out:a1','u2']);
   fake.events.push(event(6,'turn-start'),event(7,'tool',{id:'t2',name:'Read',status:'completed',output:'brief'}),event(9,'turn-result'));
   fake.out.push({...message('a2',3,'Second answer'),timestamp:time(8)});
   await service.collect(session);await service.collect(session);
   history=(await store.history('s')).messages;
-  expect(messageGroups(history).flat().map(m=>m.data?.activityKey?'activity':m.id)).toEqual(['s:out:a1','activity','u2','s:out:a2','activity']);
+  expect(messageGroups(history).flat().map(m=>m.data?.activityKey?'activity':m.id)).toEqual(['activity','s:out:a1','u2','activity','s:out:a2']);
   const blocks=history.filter(m=>m.data?.activityKey);
   expect(blocks).toHaveLength(2);expect((blocks[0].data?.tools as any[])[0].output).toBe('passed');
   await service.summarizeActivity('s',String(blocks[0].data!.activityKey));
@@ -152,4 +152,39 @@ it('restores an activity turn split across batches and retains cancellation deta
   const block=(await store.history('s')).messages[0];
   expect((block.data?.tools as any[])[0]).toMatchObject({status:'failed',error:'Cancelled command'});
   expect(await service.live('s')).toMatchObject({running:false,archived:true});
+});
+
+it('discovers task sessions and collects their replies and notifications exactly once', async () => {
+  await service.stop();
+  service = new WorkspaceService(store, {} as any);
+  await service.notifications.start();
+  for (const [id, thread] of [['task', 'system:tasks:reminder'], ['internal', 'system:utility:summary']]) {
+    await store.db.run(
+      'INSERT INTO sessions (id,agent_group_id,thread_id,status,container_status,created_at) VALUES (?,?,?,?,?,?)',
+      id, 'agent', thread, 'closed', 'stopped', new Date().toISOString(),
+    );
+  }
+  fake.out = [message('reminder', 1, 'Scheduled reminder')];
+  fake.events = [terminal(1, 'reminder-turn', [{ after: 0, upto: 1 }])];
+  await service.tick();
+  await service.tick();
+  expect((await store.history('task')).messages.filter(m => m.role === 'assistant').map(m => m.text)).toEqual(['Scheduled reminder']);
+  expect(await store.db.all("SELECT text FROM ws_activity WHERE session_id='task'")).toEqual([{ text: 'Scheduled reminder' }]);
+  expect(await store.db.get("SELECT id FROM ws_sessions WHERE id='internal'")).toBeUndefined();
+});
+
+it('archives interrupted tools once when a runtime ends without a terminal event', async () => {
+  await store.db.run("UPDATE sessions SET container_status='stopped' WHERE id='s'");
+  const state = {running:true, startedAt:new Date().toISOString(), tools:{a:{id:'a',name:'bash',status:'completed',output:'kept'},b:{id:'b',name:'bash',status:'running'}},texts:{a:'<message>partial</message>'}};
+  await store.db.run('INSERT INTO ws_live(session_id,value) VALUES (?,?)','s',JSON.stringify(state));
+  await service.collect(await store.getSession('s'));
+  const live = await service.live('s');
+  expect(live.running).toBe(false);
+  expect(live.tools.a.output).toBe('kept');
+  expect(live.tools.b.status).toBe('interrupted');
+  expect(live.texts.a).toBe('<message>partial</message>');
+  await service.collect(await store.getSession('s'));
+  const history = await store.history('s');
+  expect(history.messages.filter(m => m.kind === 'activity')).toHaveLength(1);
+  expect(history.messages.find(m => m.kind === 'activity')?.data).toMatchObject({partialText:'partial',phase:'interrupted'});
 });

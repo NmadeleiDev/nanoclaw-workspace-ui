@@ -5,6 +5,7 @@ import {
   type WorkspaceAppearance,
   type ThemePreset,
 } from '../../../src/modules/workspace-ui/appearance.js';
+import iconSvg from '../public/icon.svg?raw';
 import './themes.css';
 
 export type { WorkspaceAppearance };
@@ -44,9 +45,17 @@ export function useWorkspaceAppearance(saved: WorkspaceAppearance | undefined, d
     root.dataset.ambientMotion = String(appearance.ambientMotion);
     root.dataset.largeText = String(appearance.textScale >= 150);
     root.style.fontSize = `${appearance.textScale}%`;
+    const colors = getComputedStyle(root);
     document
       .querySelector('meta[name="theme-color"]')
-      ?.setAttribute('content', getComputedStyle(root).getPropertyValue('--bg').trim());
+      ?.setAttribute('content', colors.getPropertyValue('--bg').trim());
+    // SVG images have their own document: carry the active CSS tokens into the icon.
+    const palette = ['--bg', '--line', '--text', '--accent', '--muted']
+      .map(token => `${token}:${colors.getPropertyValue(token).trim()}`)
+      .join(';');
+    const favicon = iconSvg.replace('<svg ', `<svg style="${palette}" `);
+    document.querySelector<HTMLLinkElement>('link[rel="icon"][type="image/svg+xml"]')
+      ?.setAttribute('href', `data:image/svg+xml,${encodeURIComponent(favicon)}`);
   }, [mode, appearance.themePreset, appearance.ambientMotion, appearance.textScale]);
   useEffect(() => {
     if (!saved) return;

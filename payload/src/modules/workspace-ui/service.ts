@@ -1,5 +1,8 @@
-import { activitySources, isToolOnly, liveActivityKey, type ActivityMessage } from './activity.js';
 import { resolveProviderName } from '../../providers/provider-name.js';
+import { reduceTimeline } from './timeline.js';
+import type { RuntimeEnded } from '../../host-lifecycle.js';
+import {parseContextUsage} from './context-usage.js';
+import { activitySources, sameActivityEvidence, isToolOnly, liveActivityKey, type ActivityMessage } from './activity.js';
 import { attachmentLimitError } from './attachment-limits.js';
 import { AgentFiles } from './agent-files.js';
 import { WorkspaceSkills, type SkillAgent } from './skills.js';
@@ -117,11 +120,21 @@ export class WorkspaceService {
     } catch { /* Unconfigured endpoints retain the provider's model ID. */ }
     const connections = await listModelConnections();
     const agents = rows.map(row => {
-      const agent={...row,provider:resolveProviderName(null,row.provider)};
+      const agent = { ...row, provider: resolveProviderName(null, row.provider) };
       const connection=agent.provider==='opencode'?connections.find(c=>agent.model?.startsWith(c.id+'/')):undefined;
       return {...agent,modelProviders:Object.fromEntries(connections.map(c=>[c.id,c.name])),modelProvider:connection?{id:connection.id,label:connection.name}:agent.provider==='opencode'&&byteplus?{id:(process.env.OPENCODE_PROVIDER??env.OPENCODE_PROVIDER)||'anthropic',label:'BytePlus'}:null};
     });
-    const runtime = await this.store.db.all('SELECT id,container_status,last_active,status FROM sessions');
+    const runtime = await this.store.db.all<{ id: string; container_status: string; status: string; last_active: string | null }>('SELECT id,container_status,last_active,status FROM sessions');
+    const pending = await this.pending();
+    const waitingSessions = new Set(pending.filter(request =>
+      request.type === 'question' || ['pending', 'awaiting_reason'].includes(request.status),
+    ).map(request => request.session_id));
+    const activity = new Map((await this.store.db.all<{ session_id: string; value: string }>(
+      'SELECT session_id,value FROM ws_live',
+    )).map(row => [row.session_id, safeJson(row.value)]));
+    const activeRuntimes = new Set(runtime.filter(row =>
+      row.status === 'active' && ['running', 'idle'].includes(row.container_status),
+    ).map(row => row.id));
     const previews = await this.store.db.all<{ session_id: string; role: 'user' | 'assistant' | null; text: string | null; source: string | null; data: string; files: string | null; timestamp: string | null }>(
       `SELECT s.id AS session_id,m.role,substr(m.text,1,2000) AS text,m.source,
        CASE WHEN m.role='user' THEN m.data ELSE '{}' END AS data,m.files,m.timestamp
@@ -143,11 +156,17 @@ export class WorkspaceService {
     return {
       timezone: TIMEZONE,
       homeDirectory: os.homedir(),
-      pending: await this.pending(),
+      pending,
       agents,
       modelConnections: connections,
       projects: await this.store.projects(),
-      sessions: (await this.store.sessions()).map(session => ({ ...session, latestMessage: latestMessages.get(session.id) ?? null })),
+      sessions: (await this.store.sessions()).map(session => ({
+        ...session,
+        working: !!session.nativeSessionId && activeRuntimes.has(session.nativeSessionId) &&
+          !waitingSessions.has(session.nativeSessionId) && activity.get(session.id)?.running === true &&
+          !activity.get(session.id)?.waiting,
+        latestMessage: latestMessages.get(session.id) ?? null,
+      })),
       settings: await this.store.settings(),
       runtime,
       connected: !!this.bridge,
@@ -204,7 +223,7 @@ export class WorkspaceService {
   async updateSession(id: string, input: Partial<WorkspaceSession>) {
     return this.exclusive(id, async () => {
       const old = await this.store.getSession(id);
-      const runtimeChange = ['directories', 'primaryDirectoryId', 'model', 'effort'].some((key) => key in input);
+      const runtimeChange = ['projectId', 'directories', 'primaryDirectoryId', 'model', 'effort'].some((key) => key in input);
       if ('runtimeDriver' in input) throw new WorkspaceError(400,'This add-on supports Docker sessions.');
       if (input.directories) requireDirectories(input.directories);
       // Validate the complete update before touching a running container.
@@ -301,7 +320,7 @@ export class WorkspaceService {
 
   async pending(sessionId?: string) {
     const approvals = await this.store.db.all<any>(
-      `SELECT approval_id AS id,session_id,agent_group_id,title,question,options_json,status,approver_user_id,expires_at FROM pending_approvals WHERE status IN ('pending','awaiting_reason') ${sessionId ? 'AND session_id=?' : ''}`,
+      `SELECT approval_id AS id,session_id,agent_group_id,title,question,options_json,status,application_state,approver_user_id,CASE WHEN status='awaiting_reason' THEN reason_deadline_at ELSE expires_at END AS expires_at FROM pending_approvals WHERE (status IN ('pending','awaiting_reason','expired') OR (status='approved' AND application_state='applying' AND archived_at IS NULL)) AND NOT EXISTS (SELECT 1 FROM ws_dismissed_requests d WHERE d.request_id=pending_approvals.approval_id) ${sessionId ? 'AND session_id=?' : ''}`,
       ...(sessionId ? [sessionId] : []),
     );
     const questions = await this.store.db.all<any>(
@@ -309,9 +328,21 @@ export class WorkspaceService {
       ...(sessionId ? [sessionId] : []),
     );
     return [
-      ...approvals.map((a) => ({ ...a, type: 'approval', options: JSON.parse(a.options_json || '[]') })),
+      ...approvals.map((a) => ({ ...a, status: a.expires_at && Date.parse(a.expires_at) <= Date.now() ? 'expired' : a.status, type: 'approval', options: JSON.parse(a.options_json || '[]') })),
       ...questions.map((q) => ({ ...q, type: 'question', options: JSON.parse(q.options_json || '[]') })),
     ];
+  }
+
+  async dismissExpiredRequest(id: string) {
+    await this.store.db.transaction(async()=>{
+      const row = await this.store.db.get<any>('SELECT expires_at,status FROM pending_approvals WHERE approval_id=?',id);
+      if (!row) throw new WorkspaceError(404,'Approval request not found.');
+      if (!(row.expires_at && Date.parse(row.expires_at) <= Date.now()))
+        throw new WorkspaceError(409,'Only expired approval requests can be dismissed.');
+      await this.store.db.run('INSERT INTO ws_dismissed_requests (request_id,dismissed_at) VALUES (?,?) ON CONFLICT(request_id) DO NOTHING',id,stamp());
+    });
+    this.changed();
+    return {dismissed:true};
   }
 
   async live(id: string) {
@@ -331,7 +362,7 @@ export class WorkspaceService {
     try {
       if (this.bridge) {
         const rows = await this.store.db.all<any>(
-          "SELECT s.*,m.channel_type FROM sessions s LEFT JOIN messaging_groups m ON m.id=s.messaging_group_id WHERE s.thread_id IS NULL OR s.thread_id NOT LIKE 'system:%' OR s.thread_id LIKE 'system:workspace:%'",
+          "SELECT s.*,m.channel_type FROM sessions s LEFT JOIN messaging_groups m ON m.id=s.messaging_group_id WHERE s.thread_id IS NULL OR s.thread_id NOT LIKE 'system:%' OR s.thread_id LIKE 'system:workspace:%' OR s.thread_id LIKE 'system:tasks:%'",
         );
         for (const row of rows) {
           const old = await this.store.db.get('SELECT id FROM ws_sessions WHERE id=?', row.id);
@@ -365,7 +396,7 @@ export class WorkspaceService {
     }
   }
 
-  async collect(session: WorkspaceSession): Promise<void> {
+  async collect(session: WorkspaceSession, ended?: RuntimeEnded): Promise<void> {
     if (!session.nativeSessionId) return;
     const cursors = await this.store.db.all<{ direction: string; cursor: number }>(
       'SELECT direction,cursor FROM ws_cursors WHERE session_id=?',
@@ -481,6 +512,27 @@ export class WorkspaceService {
     }
     if (batch.events.some(event => ['turn-finished','turn-result','turn-cancelled','turn-error'].includes(event.kind)))
       await this.activitySummaries(session.id);
+    // Only reconcile after the event backlog is drained. Recheck runtime truth
+    // inside the transaction so a newly launched incarnation is never closed.
+    if (batch.events.length < 500) await this.store.db.transaction(async () => {
+      const runtime = await this.store.db.get<{container_status:string}>('SELECT container_status FROM sessions WHERE id=?', session.nativeSessionId!);
+      if (!runtime || runtime.container_status !== 'stopped') return;
+      const live = await this.live(session.id);
+      if (!live?.running) return;
+      live.running = false;
+      if (live.runtimeIncarnation !== undefined && ended?.incarnation !== undefined && live.runtimeIncarnation !== ended.incarnation) return;
+      live.error = ended ? `The agent runtime stopped (${ended.reason}) before this turn finished.` : 'The agent runtime stopped before this turn finished.';
+      live.updatedAt = stamp();
+      for (const tool of Object.values(live.tools ?? {}) as any[]) if (tool.status === 'running') tool.status = 'interrupted';
+      await this.store.db.run('UPDATE ws_live SET value=? WHERE session_id=?', JSON.stringify(live), session.id);
+      const partialText = (Object.values(live.texts ?? {}) as string[]).map(text => /<message(?:\s[^>]*)?>([\s\S]*)/.exec(text)?.[1]?.replace(/<\/message>[\s\S]*$/, '') ?? '').filter(Boolean).join('\n');
+      if (live.startedAt && (Object.keys(live.tools ?? {}).length || live.timeline?.length || partialText)) {
+        await this.store.db.run(`INSERT INTO ws_messages (id,session_id,role,kind,text,timestamp,source,files,data)
+          VALUES (?,?,'tool','activity','',?,'agent','[]',?) ON CONFLICT(id) DO NOTHING`,
+          `${session.id}:${liveActivityKey(live)}`,session.id,live.updatedAt,JSON.stringify({activityKey:liveActivityKey(live),timeline:live.timeline,phase:'interrupted',partialText,startedAt:live.startedAt,endedAt:live.updatedAt,tools:Object.values(live.tools),turnError:live.error}));
+      }
+      changed = true;
+    });
     if (changed) this.changed();
   }
 
@@ -592,27 +644,44 @@ export class WorkspaceService {
 
   private reduceActivity(live: any, row: WorkspaceMailboxEvent) {
     const data = safeJson(row.content);
-    if (row.kind === 'turn-start') live = { running: true, startedAt: row.timestamp, tools: {}, texts: {} };
-    else if (row.kind === 'text-delta') live.texts[data.id] = `${live.texts[data.id] ?? ''}${data.delta ?? ''}`.slice(-100_000);
+    if (row.kind === 'text-delta' || row.kind === 'tool') reduceTimeline(live.timeline ??= [], row.kind, data);
+    if(row.kind==='turn-waiting'){live.waiting=true;live.running=false;}
+    else if (row.kind === 'turn-start') live = { running: true, startedAt: row.timestamp, tools: {}, texts: {}, timeline: [], usage:live.usage };
+    else if(row.kind==='usage') {if(data.reset===true)delete live.usage;else{const usage=parseContextUsage(data);if(usage)live.usage={...usage,updatedAt:row.timestamp};}}
+    else if (row.kind === 'text-delta') live.texts[data.id] = typeof data.text === 'string' ? data.text : `${live.texts[data.id] ?? ''}${data.delta ?? ''}`;
     else if (row.kind === 'tool') live.tools[data.id] = { ...live.tools[data.id], ...data };
     else if (row.kind === 'turn-error') { live.error = data.message; live.running = false; }
     else if (row.kind === 'turn-result' || row.kind === 'turn-cancelled') { live.running = false; live.texts = {}; }
+    if (['turn-result','turn-error','turn-cancelled','turn-waiting'].includes(row.kind))
+      for (const entry of live.timeline ?? []) { if (entry.kind === 'tool' && entry.status === 'running') entry.status = 'interrupted'; }
     live.updatedAt = row.timestamp;
     return live;
   }
 
   private async archiveActivity(id: string, rows: WorkspaceMailboxEvent[], previous?: string) {
     let state = previous ? JSON.parse(previous) : { running: false, tools: {}, texts: {} };
+    const { automaticSummaries } = await this.store.settings();
     for (const row of rows) {
       state = this.reduceActivity(state,row);
-      if (state.startedAt && !state.running && Object.keys(state.tools ?? {}).length) {
+      if (state.startedAt && !state.running && (Object.keys(state.tools ?? {}).length || state.timeline?.length)) {
         const key = liveActivityKey(state);
         // A stable message ID makes replay and repeated terminal events idempotent.
         // Keep this display record out of session recency/title and agent mailbox writes.
+        const activity = {id:`${id}:${key}`,role:'tool',text:'',files:[],timestamp:row.timestamp,
+          data:{activityKey:key,startedAt:state.startedAt,endedAt:row.timestamp,
+            timeline:state.timeline,phase:state.waiting?'before-approval':undefined,
+            tools:Object.values(state.tools).map((tool:any)=>state.waiting&&tool.status==='running'?{...tool,status:'interrupted'}:tool),turnError:state.error}};
         await this.store.db.run(`INSERT INTO ws_messages (id,session_id,role,kind,text,timestamp,source,files,data)
           VALUES (?,?,'tool','activity','',?,'agent','[]',?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
-          `${id}:${key}`,id,row.timestamp,JSON.stringify({activityKey:key,startedAt:state.startedAt,endedAt:row.timestamp,
-            tools:Object.values(state.tools),turnError:state.error}));
+          activity.id,id,row.timestamp,JSON.stringify(activity.data));
+        // Queue each archived turn before a following turn-start can replace live state.
+        // Timeline blocks own their summaries; the envelope is only for older tool-only turns.
+        if (automaticSummaries) {
+          const sources = activitySources([activity], null);
+          const blocks = sources.filter(source=>source.turnKey);
+          for (const source of blocks.length ? blocks : sources)
+            await this.queueActivitySummary(id, source, false);
+        }
       }
     }
     await this.store.db.run(`INSERT INTO ws_activity_cursors (session_id,cursor,value) VALUES (?,?,?)
@@ -621,7 +690,10 @@ export class WorkspaceService {
 
   private async applyEvents(id: string, rows: WorkspaceMailboxEvent[]) {
     let live = (await this.live(id)) ?? { running: false, tools: {}, texts: {} };
-    for (const row of rows) live = this.reduceActivity(live,row);
+    for (const row of rows) {
+      live = this.reduceActivity(live,row);
+
+    }
     await this.store.db.run(
       'INSERT INTO ws_live (session_id,value) VALUES (?,?) ON CONFLICT(session_id) DO UPDATE SET value=excluded.value',
       id, JSON.stringify(live),
@@ -635,20 +707,23 @@ export class WorkspaceService {
     const sources = activitySources(history, state);
     const settings = await this.store.settings();
     // Backfill only the latest visible block. Older blocks are summarized on demand.
-    if (settings.automaticSummaries && sources.length && !state?.running)
-      await this.queueActivitySummary(sessionId, sources.at(-1)!, false);
+    if (settings.automaticSummaries && sources.length && !state?.running) {
+      const latest = sources.at(-1)!;
+      for (const source of latest.turnKey ? sources.filter(source=>source.turnKey===latest.turnKey) : [latest])
+        await this.queueActivitySummary(sessionId, source, false);
+    }
     const rows = await this.store.db.all<any>(
       `SELECT a.group_key,a.summary,a.source_key,a.evidence,j.state,j.error FROM ws_activity_summaries a
        LEFT JOIN ws_utility_jobs j ON j.scope_id=a.id AND j.task='activity-summary' WHERE a.session_id=?`, session.id);
-    return Object.fromEntries(rows.filter(row => !row.group_key.startsWith('live:') || sources.some(source => source.key === row.group_key && digest(source.evidence) === row.source_key))
-      .map(row => [row.group_key, { text: row.summary, count: row.evidence.split('\n').length, state: row.state, error: row.state === 'failed' ? 'Activity summary unavailable. Check the utility model or retry.' : null }]));
+    return Object.fromEntries(rows.filter(row => !row.group_key.startsWith('live:') || sources.some(source => source.key === row.group_key && digest(row.evidence) === row.source_key && sameActivityEvidence(source.key,row.evidence,source.evidence)))
+      .map(row => [row.group_key, { text: row.summary, count: sources.find(source=>source.key===row.group_key)?.count ?? row.evidence.split('\n').length, state: row.state, error: row.state === 'failed' ? 'Activity summary unavailable. Check the utility model or retry.' : null }]));
   }
 
   private async queueActivitySummary(sessionId: string, source: {key: string; evidence: string}, retry: boolean) {
     const id = digest(`${sessionId}:${source.key}`);
     const sourceKey = digest(source.evidence);
-    const known = await this.store.db.get<any>("SELECT a.source_key,j.state FROM ws_activity_summaries a LEFT JOIN ws_utility_jobs j ON j.scope_id=a.id AND j.task='activity-summary' WHERE a.id=?",id);
-    if (known?.source_key === sourceKey && known.state && (!retry || known.state !== 'failed')) return;
+    const known = await this.store.db.get<any>("SELECT a.source_key,a.evidence,j.state FROM ws_activity_summaries a LEFT JOIN ws_utility_jobs j ON j.scope_id=a.id AND j.task='activity-summary' WHERE a.id=?",id);
+    if (known && (known.source_key === sourceKey || (digest(known.evidence) === known.source_key && sameActivityEvidence(source.key,known.evidence,source.evidence))) && known.state && (!retry || known.state !== 'failed')) return;
     await this.store.db.run(`INSERT INTO ws_activity_summaries (id,session_id,group_key,source_key,evidence,summary,updated_at)
       VALUES (?,?,?,?,?,'',?) ON CONFLICT(id) DO UPDATE SET source_key=excluded.source_key,evidence=excluded.evidence,summary='',updated_at=excluded.updated_at
       WHERE ws_activity_summaries.source_key<>excluded.source_key`, id,sessionId,source.key,sourceKey,source.evidence,stamp());
@@ -660,7 +735,7 @@ export class WorkspaceService {
     await this.store.getSession(sessionId);
     let messages: ActivityMessage[] = [];
     if (key.startsWith('live:')) {
-      const row = await this.store.db.get<any>('SELECT * FROM ws_messages WHERE session_id=? AND id=?',sessionId,`${sessionId}:${key}`);
+      const row = await this.store.db.get<any>('SELECT * FROM ws_messages WHERE session_id=? AND id=?',sessionId,`${sessionId}:${key.split(':tools:')[0]}`);
       if (row) messages = [{...row,files:JSON.parse(row.files),data:safeJson(row.data)}];
     } else {
       if (!Array.isArray(messageIds) || !messageIds.length || messageIds.length > 500 ||
