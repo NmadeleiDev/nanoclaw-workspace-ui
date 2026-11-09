@@ -162,3 +162,16 @@ registerMigration({version:9,name:'module:workspace-ui:document-viewer',async up
  CREATE TABLE ws_viewer_requests(seq INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL REFERENCES ws_sessions(id) ON DELETE CASCADE,request_id TEXT UNIQUE NOT NULL,action TEXT NOT NULL,document_id TEXT NOT NULL);
  CREATE INDEX ws_viewer_requests_session ON ws_viewer_requests(session_id,seq);`);
 }});
+
+// Old MAX(seq)-based allocation could reuse numbers after echo/task deletion.
+// Replay retained inbound rows even when the mailbox has since passed its old
+// cursor: testing only cursor > MAX(seq) would leave those historical gaps.
+// Stable message IDs deduplicate projections; no agent work is replayed.
+export const workspaceInboundSequenceRecovery: ModuleMigration = {
+  version: 12,
+  name: 'module:workspace-ui:inbound-sequence-recovery',
+  async up(db) {
+    await db.run("UPDATE ws_cursors SET cursor=-1 WHERE direction IN ('in','question-history-in')");
+  },
+};
+registerMigration(workspaceInboundSequenceRecovery);

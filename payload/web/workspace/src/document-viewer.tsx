@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import Markdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { WorkspaceMarkdown as Markdown } from './markdown';
 import type * as PdfTypes from 'pdfjs-dist';
 import worker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
@@ -9,16 +8,36 @@ type Doc = {
   id: string;
   name: string;
   kind: string;
+  mime?: string;
   revision: string;
   editable: boolean;
   text?: string;
   size: number;
   source: { path?: string; attachmentId?: string };
 };
-type Tab = { doc: Doc; draft?: string; error?: string; conflict?: boolean; editing?: boolean; scroll?: number };
+type Tab = { doc: Doc; draft?: string; error?: string; conflict?: boolean; editing?: boolean; source?: boolean; reload?: number; scroll?: number };
 const states = new Map<string, { tabs: Tab[]; active: string; visible: boolean }>();
 export function openDocument(session: string, attachmentId: string) {
   window.dispatchEvent(new CustomEvent('workspace-document-open', { detail: { session, attachmentId } }));
+}
+export function HtmlPreview({ html, name }: { html: string; name: string }) {
+  const sent = useRef(false);
+  return (
+    <iframe
+      className="document-html"
+      title={`Preview ${name}`}
+      src="/api/document-preview"
+      sandbox="allow-scripts"
+      referrerPolicy="no-referrer"
+      onLoad={(event) => {
+        // Send once to the empty, trusted shell. Never resend document bytes
+        // after the embedded page navigates to a different location.
+        if (sent.current) return;
+        sent.current = true;
+        event.currentTarget.contentWindow?.postMessage({ type: 'workspace-html-preview', html }, '*');
+      }}
+    />
+  );
 }
 function DocumentGlyph({ kind }: { kind?: string }) {
   return (
@@ -118,12 +137,15 @@ function Pdf({ data }: { data: Uint8Array }) {
     </>
   );
 }
-function Binary({ url, kind, name }: { url: string; kind: string; name: string }) {
+export function Binary({ url, kind, name, mime }: { url: string; kind: string; name: string; mime?: string }) {
   const [bytes, setBytes] = useState<Uint8Array>(),
     [src, setSrc] = useState(''),
     [error, setError] = useState('');
   useEffect(() => {
     const abort = new AbortController();
+    setError('');
+    setSrc('');
+    setBytes(undefined);
     let object = '';
     void fetch(url, { signal: abort.signal })
       .then(async (r) => {
@@ -132,7 +154,7 @@ function Binary({ url, kind, name }: { url: string; kind: string; name: string }
         if (kind === 'pdf') setBytes(data);
         else {
           const ext = name.split('.').at(-1)?.toLowerCase();
-          object = URL.createObjectURL(new Blob([data], { type: `image/${ext === 'jpg' ? 'jpeg' : ext}` }));
+          object = URL.createObjectURL(new Blob([data], { type: mime ?? `image/${ext === 'jpg' ? 'jpeg' : ext}` }));
           setSrc(object);
         }
       })
@@ -143,7 +165,7 @@ function Binary({ url, kind, name }: { url: string; kind: string; name: string }
       abort.abort();
       if (object) URL.revokeObjectURL(object);
     };
-  }, [url, kind, name]);
+  }, [url, kind, name, mime]);
   return error ? (
     <p role="alert">{error}</p>
   ) : kind === 'pdf' ? (
@@ -152,8 +174,12 @@ function Binary({ url, kind, name }: { url: string; kind: string; name: string }
     ) : (
       <p>Loading…</p>
     )
+  ) : kind === 'video' ? (
+    <video className="document-video" src={src || undefined} aria-label={name} controls playsInline preload="metadata"
+      onError={() => setError('This browser could not play this video. Use Download to open it in another player.')} />
   ) : (
-    <img className="document-image" src={src || undefined} alt={name} />
+    <img className="document-image" src={src || undefined} alt={name}
+      onError={() => setError('This browser could not display this image. Use Download.')} />
   );
 }
 function DocumentImage({
@@ -189,7 +215,7 @@ function DocumentImage({
     };
   }, [src, source, base]);
   return doc?.kind === 'image' ? (
-    <Binary url={`${base}/${doc.id}/content`} kind="image" name={doc.name} />
+    <Binary url={`${base}/${doc.id}/content`} kind="image" name={doc.name} mime={doc.mime} />
   ) : (
     <span role={error ? 'status' : undefined}>
       {alt || 'Image'}
@@ -247,6 +273,7 @@ export function DocumentViewer({
       setError('');
       const old = state.tabs.find((t) => t.doc.id === id);
       if (old) {
+        if (action === 'refresh') old.reload = (old.reload ?? 0) + 1;
         if (!dirty(old)) {
           old.doc = doc;
           old.draft = undefined;
@@ -398,6 +425,7 @@ export function DocumentViewer({
     return () => window.removeEventListener('keydown', key);
   }, [session]);
   const reopenTarget = document.getElementById('document-reopen-slot');
+  const htmlPreview = active?.doc.kind === 'html' && active.doc.text !== undefined && !active.editing && !active.source;
   if (!state.visible)
     return reopenTarget
       ? createPortal(
@@ -544,11 +572,20 @@ export function DocumentViewer({
         <>
           <div className="document-toolbar">
             <span title={active.doc.source.path}>{active.doc.source.path || 'Attachment'}</span>
+            {active.doc.kind === 'html' && active.doc.text !== undefined && !active.editing && (
+              <button onClick={() => {
+                active.source = !active.source;
+                update();
+              }}>
+                {active.source ? 'Preview' : 'Source'}
+              </button>
+            )}
             {active.doc.editable && (
               <>
                 <button
                   onClick={() => {
                     active.editing = !active.editing;
+                    active.source = false;
                     update();
                   }}
                 >
@@ -590,9 +627,9 @@ export function DocumentViewer({
             </div>
           )}
           <div
-            className="document-body"
+            className={`document-body${htmlPreview ? ' document-body-html' : ''}`}
             data-quote-source={
-              !active.editing && ['markdown', 'text', 'pdf'].includes(active.doc.kind)
+              !active.editing && (['markdown', 'text', 'pdf'].includes(active.doc.kind) || (active.doc.kind === 'html' && active.source))
                 ? `document:${session}:${active.doc.id}:${active.doc.revision}:${dirty(active) ? 'draft' : 'saved'}`
                 : undefined
             }
@@ -620,10 +657,16 @@ export function DocumentViewer({
                   update();
                 }}
               />
+            ) : htmlPreview ? (
+              <HtmlPreview
+                key={`${active.doc.revision}:${active.reload ?? 0}`}
+                html={active.draft ?? active.doc.text!}
+                name={active.doc.name}
+              />
             ) : active.doc.kind === 'markdown' && active.doc.text !== undefined ? (
               <div className="markdown">
                 <Markdown
-                  remarkPlugins={[remarkGfm]}
+
                   components={{
                     a: ({ href, children }) => (
                       <a
@@ -648,14 +691,15 @@ export function DocumentViewer({
                   {active.draft ?? active.doc.text}
                 </Markdown>
               </div>
-            ) : active.doc.kind === 'text' && active.doc.text !== undefined ? (
+            ) : ['text', 'html'].includes(active.doc.kind) && active.doc.text !== undefined ? (
               <pre>{active.draft ?? active.doc.text}</pre>
-            ) : ['pdf', 'image'].includes(active.doc.kind) ? (
+            ) : ['pdf', 'image', 'video'].includes(active.doc.kind) ? (
               <Binary
-                key={active.doc.revision}
+                key={`${active.doc.revision}:${active.reload ?? 0}`}
                 url={`${base}/${active.doc.id}/content?revision=${active.doc.revision}`}
                 kind={active.doc.kind}
                 name={active.doc.name}
+                mime={active.doc.mime}
               />
             ) : (
               <p>Preview unavailable for this format or size. Use Download.</p>

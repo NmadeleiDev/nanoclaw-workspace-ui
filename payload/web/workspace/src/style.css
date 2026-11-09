@@ -4505,12 +4505,15 @@ label > textarea {
 .document-toolbar button:not(:disabled):nth-last-child(3) { color:var(--text); }
 .document-body { flex:1; min-height:0; overflow:auto; padding:36px 32px 80px; overscroll-behavior:contain; scrollbar-gutter:stable; }
 .document-body>.markdown { max-width:72ch; margin:auto; font-size:.9375rem; line-height:1.8; }
+.document-drawer .document-body-html { padding:0; overflow:hidden; scrollbar-gutter:auto; }
+.document-html { display:block; width:100%; height:100%; border:0; background:#fff; color-scheme:normal; }
 .document-body .markdown h1 { font-size:1.7rem; letter-spacing:-.035em; line-height:1.25; margin:0 0 24px; }
 .document-body .markdown h2 { font-size:1.2rem; letter-spacing:-.02em; margin:32px 0 12px; }
 .document-body .markdown h3 { font-size:1rem; margin:24px 0 10px; }
 .document-body pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:.8125rem; line-height:1.8; }
 .document-body textarea { width:100%; height:100%; min-height:300px; resize:none; background:transparent; color:var(--text); font:inherit; font-family:ui-monospace,SFMono-Regular,monospace; font-size:.8125rem; line-height:1.85; border:0; padding:0; outline:none; tab-size:2; }
 .document-image { display:block; max-width:100%; height:auto; margin:auto; border-radius:6px; }
+.document-video { display:block; width:100%; max-height:100%; margin:auto; background:#000; border-radius:6px; }
 .pdf-pages canvas { display:block; max-width:100%; height:auto; margin:auto; background:white; box-shadow:0 2px 12px #0002; }
 .pdf-text { white-space:pre-wrap; padding:16px; line-height:1.6; font-size:.8125rem; }
 .document-conflict { padding:12px 18px; border-bottom:1px solid var(--line); background:var(--surface-2); font-size:.8125rem; line-height:1.6; }
@@ -4549,3 +4552,17 @@ label > textarea {
 .composer-quote button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
 @media(pointer:coarse){.composer-quote-heading>button{min-width:44px;min-height:44px;}.composer-quote-expand{min-height:36px;}}
 @media(max-width:650px){.composer-quotes{max-height:32dvh;padding:12px 12px 0;}.composer-quote{padding:8px 10px;}}
+
+.mermaid-block { min-width: 0; margin-block: 1rem; border: 1px solid var(--line); border-radius: 12px; padding: .75rem; background: var(--surface); }
+.mermaid-controls { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-bottom: .5rem; }
+.mermaid-controls button, .mermaid-expanded > button { display: inline-flex; align-items: center; justify-content: center; width: 2.5rem; height: 2.5rem; padding: 0; color: var(--muted); background: transparent; border: 0; box-shadow: none; border-radius: 8px; cursor: pointer; }
+.mermaid-controls button:hover:not(:disabled), .mermaid-controls button[aria-pressed="true"], .mermaid-expanded > button:hover { color: var(--text); background: var(--surface-2); }
+.mermaid-controls button:focus-visible, .mermaid-expanded > button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mermaid-controls button:disabled { opacity: .4; cursor: default; }
+.mermaid-controls button svg, .mermaid-expanded > button svg { display: block; flex-shrink: 0; }
+.mermaid-expanded > .mermaid-close { display: flex; margin-left: auto; }
+.mermaid-canvas { overflow: auto; max-width: 100%; }
+.mermaid-canvas svg { display: block; margin: auto; max-width: none !important; }
+.mermaid-expanded { width: 94vw; max-width: 94vw; max-height: 92vh; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+.mermaid-expanded::backdrop { background: #0009; }
+.mermaid-expanded .mermaid-canvas { margin-top: 1rem; max-height: 78vh; }

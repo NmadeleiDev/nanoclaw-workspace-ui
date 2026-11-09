@@ -14,8 +14,7 @@ import { PresetChoices, useWorkspaceAppearance, type WorkspaceAppearance } from 
 import { AmbientBackground } from './ambient-background';
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
-import Markdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { WorkspaceMarkdown as Markdown } from './markdown';
 import { directoryLabel } from '../../../src/modules/workspace-ui/path-label.js';
 
 const AgentModelSettings = React.lazy(() => import('./agent-settings').then(m => ({default:m.AgentModelSettings})));
@@ -390,7 +389,7 @@ function RichText({ text, quoteId }: { text: string; quoteId?: string }) {
   return (
     <div className="markdown" data-quote-source={quoteId}>
       <Markdown
-        remarkPlugins={[remarkGfm]}
+
         components={{
           a: ({ children, href }) => (
             <a href={href} target="_blank" rel="noopener noreferrer" onClick={event=>{
@@ -495,7 +494,7 @@ function AgentFiles({ agentId }: { agentId: string }) {
         {displayed?.updatedAt && <p className="agent-file-updated">Updated {fullTime(displayed.updatedAt)}</p>}
         {detailError ? <p role="alert">{detailError}</p> : !displayed ? <p role="status">Loading file…</p>
           : !displayed.markdown?.trim() ? <p className="skills-state">This file is empty.</p>
-          : <div className="markdown agent-file-body"><Markdown remarkPlugins={[remarkGfm]} components={{ a: ({ children, href }) => {
+          : <div className="markdown agent-file-body"><Markdown components={{ a: ({ children, href }) => {
             const linkedFile = href ? openLink(href) : null;
             if (linkedFile) return <button className="agent-file-link" onClick={() => setHistory(old => [...old, linkedFile])}>{children}</button>;
             if (href && /^https?:\/\//i.test(href)) return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>;

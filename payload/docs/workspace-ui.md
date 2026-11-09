@@ -380,9 +380,13 @@ OpenCode turns retain text, provider-reported reasoning and tool calls in arriva
 
 ### Document drawer
 
-Click an attachment in chat or Files to open the document drawer on the right. Its tabs are remembered per conversation in this browser. Context restores the previous context panel; closing the drawer keeps its tabs. Markdown, UTF-8 text/code, PDF and raster images are previewable. Unsupported formats remain downloadable. Text previews are limited to 2 MiB, other previews to 20 MiB. PDFs are rendered locally; no document bytes go to an external viewer.
+Click an attachment in chat or Files to open the document drawer on the right. Its tabs are remembered per conversation in this browser. Context restores the previous context panel; closing the drawer keeps its tabs. Markdown, UTF-8 text/code, HTML pages, PDF, images (including SVG and ICO), and videos are previewable. Unsupported formats remain downloadable. Text previews are limited to 2 MiB, other previews to 20 MiB. PDFs are rendered locally; no document bytes go to an external viewer.
 
-Working text and Markdown documents have Edit and Save (Cmd/Ctrl+S). Attachments and read-only folders cannot be edited. Clean documents follow disk changes; unsaved drafts are preserved and stale saves rejected. Copy draft and Reload latest resolve a conflict. Drafts survive switching tabs or chats in the current page; leaving the page asks before discarding them. Prior disk bytes are retained under private workspace-files/.document-revisions before saves.
+HTML (`.html`, `.htm`, or HTML attachments identified by MIME type) opens as a full page with its own styles and JavaScript. **Source** shows the markup; **Preview** returns to the page. **Refresh** reloads the file and restarts the page. The preview fills the drawer, including expanded and mobile views. Self-contained pages can use embedded assets and absolute HTTPS resources; sibling files and relative asset URLs are not served as a website. Scripts run in an opaque sandbox: they cannot read workspace state, access its API, submit forms, open popups, or navigate the top-level workspace. A separate authenticated preview response keeps the workspace’s own script policy strict. HTML source and editing use the same 2 MiB text limit. Selection quoting is available from Source.
+
+Videos use the browser’s player with playback, seek, volume and fullscreen controls; playback starts on request. MP4/M4V, WebM, Ogg video and MOV are recognized by extension or attachment MIME type. Codec support depends on the browser; playback failures offer Download. Image attachments are also recognized by MIME type when their filename has no extension. Media previews share the existing 20 MiB limit.
+
+Working text, HTML and Markdown documents have Edit and Save (Cmd/Ctrl+S). Attachments and read-only folders cannot be edited. Clean documents follow disk changes; unsaved drafts are preserved and stale saves rejected. Copy draft and Reload latest resolve a conflict. Drafts survive switching tabs or chats in the current page; leaving the page asks before discarding them. Prior disk bytes are retained under private workspace-files/.document-revisions before saves.
 
 Agents use `workspace_viewer` with operation `open` and `path` or `attachmentId`, then `focus`/`refresh` with the returned `documentId`. `list` returns registered documents. The tool requests presentation in this conversation and does not confirm receipt by a user. Agents cannot close tabs or discard edits. Working files must be in the agent workspace or an explicitly accessible mounted folder. Hidden and runtime/credential files are excluded. Live saves are disabled in isolated previews.
 
@@ -392,3 +396,14 @@ Select a passage in a document preview and choose **Quote** (or Alt/Option+Q) to
 ### Runner replacement and Stop
 
 An unfinished turn becomes **Interrupted** when its runner is replaced, including when the replacement is already idle or working. Retained output stays in history. Stop requests cancellation of an active turn; when the session is idle it refreshes activity and reports that nothing is running. A request acknowledgement is not proof that a command has terminated.
+
+### Mermaid diagrams
+
+Fenced `mermaid` blocks render in chat and Markdown previews, with Expand, Source and Copy source controls.
+
+Incoming history recovery runs once on upgrade to the durable inbound sequence
+counter. It resets only the incoming chat and question-response projection cursors,
+then collects retained rows in normal bounded batches. Stable message IDs prevent
+duplicates, and history revisions notify connected clients of recovered messages.
+This also repairs gaps when newer messages have already passed the old cursor.
+Agent execution, outgoing delivery, and notification cursors are not replayed.

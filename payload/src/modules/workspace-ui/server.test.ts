@@ -64,6 +64,26 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+it('isolates executable HTML previews without relaxing the workspace policy or API authorization', async () => {
+  expect((await fetch(`${base}/api/document-preview`)).status).toBe(401);
+  const preview = await fetch(`${base}/api/document-preview`, { headers: { Cookie: cookie } });
+  expect(preview.status).toBe(200);
+  expect(preview.headers.get('content-type')).toBe('text/html; charset=utf-8');
+  expect(preview.headers.get('x-frame-options')).toBe('SAMEORIGIN');
+  const policy = preview.headers.get('content-security-policy')!;
+  expect(policy).toContain('sandbox allow-scripts');
+  expect(policy).not.toContain('allow-same-origin');
+  expect(policy).toContain("frame-ancestors 'self'");
+  expect(policy).toContain("form-action 'none'");
+  expect(await preview.text()).toContain('event.source !== parent');
+  const app = await fetch(base);
+  expect(app.headers.get('content-security-policy')).toContain("script-src 'self';");
+  expect(app.headers.get('x-frame-options')).toBe('DENY');
+  // Executing preview code has an opaque origin, even on a tailnet workspace.
+  expect((await fetch(`${base}/api/bootstrap`, { headers: { Cookie: cookie, Origin: 'null' } })).status).toBe(403);
+  expect((await fetch(`${base}/api/bootstrap`, { headers: { Cookie: cookie, 'Sec-Fetch-Site': 'cross-site' } })).status).toBe(403);
+});
+
 it('serves the real protected API through pairing, CSRF, and role checks', async () => {
   expect((await fetch(`${base}/api/bootstrap`)).status).toBe(401);
   expect((await fetch(`${base}/api/bootstrap`, { headers: { Cookie: cookie } })).status).toBe(200);

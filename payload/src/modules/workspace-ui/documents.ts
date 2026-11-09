@@ -9,6 +9,20 @@ import { AnchoredDir } from '../../anchored-dir.js';
 import { WorkspaceError } from './types.js';
 import type { WorkspaceService } from './service.js';
 const hash = (b: Buffer | string) => createHash('sha256').update(b).digest('hex');
+
+// A separate response avoids inheriting the workspace's strict script policy.
+// Enforce the opaque origin in the response too, including direct navigation.
+export const HTML_PREVIEW_CSP =
+  "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' https: blob: data:; style-src 'unsafe-inline' https:; img-src https: data: blob:; font-src https: data:; media-src https: data: blob:; connect-src https:; worker-src blob:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts";
+export const HTML_PREVIEW_SHELL = `<!doctype html><html><head><meta charset="utf-8"><title>HTML preview</title></head><body><script>
+addEventListener('message', function render(event) {
+  if (event.source !== parent || event.data?.type !== 'workspace-html-preview' || typeof event.data.html !== 'string') return;
+  removeEventListener('message', render);
+  document.open();
+  document.write(event.data.html);
+  document.close();
+});
+</script></body></html>`;
 export class WorkspaceDocuments {
   constructor(readonly service: WorkspaceService) {}
   async list(session: string) {
@@ -188,25 +202,48 @@ export class WorkspaceDocuments {
     const source = await this.source(session, id),
       file = await this.readSource(session, source);
     const ext = path.extname(file.name).toLowerCase();
+    const mediaTypes: Record<string, string> = {
+      '.mp4': 'video/mp4',
+      '.m4v': 'video/mp4',
+      '.webm': 'video/webm',
+      '.ogv': 'video/ogg',
+      '.mov': 'video/quicktime',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif',
+      '.webp': 'image/webp',
+      '.avif': 'image/avif',
+      '.bmp': 'image/bmp',
+      '.svg': 'image/svg+xml',
+      '.ico': 'image/x-icon',
+    };
+    const suppliedMime = file.mime.split(';')[0].trim().toLowerCase();
+    const mime = mediaTypes[ext] ?? (Object.values(mediaTypes).includes(suppliedMime) ? suppliedMime : undefined);
     const kind = file.tooLarge
       ? 'unsupported'
       : ext === '.pdf'
         ? 'pdf'
-        : /\.(png|jpe?g|gif|webp|avif|bmp)$/.test(ext)
-          ? 'image'
-          : /\.(md|markdown)$/.test(ext)
-            ? 'markdown'
-            : /\.(txt|log|json|yaml|yml|toml|csv|ts|tsx|js|jsx|py|sh|css|html|xml|sql|rs|go|java|c|cpp|h)$/.test(ext)
-              ? 'text'
-              : 'unsupported';
+        : mime?.startsWith('video/')
+          ? 'video'
+          : mime?.startsWith('image/')
+            ? 'image'
+            : /\.(md|markdown)$/.test(ext)
+              ? 'markdown'
+              : /\.(html|htm)$/.test(ext) || file.mime.split(';')[0].trim().toLowerCase() === 'text/html'
+                ? 'html'
+                : /\.(txt|log|json|yaml|yml|toml|csv|ts|tsx|js|jsx|py|sh|css|xml|sql|rs|go|java|c|cpp|h)$/.test(ext)
+                  ? 'text'
+                  : 'unsupported';
     const text =
-      ['text', 'markdown'].includes(kind) && file.data.length <= 2 * 1024 * 1024 && !file.data.includes(0)
+      ['text', 'markdown', 'html'].includes(kind) && file.data.length <= 2 * 1024 * 1024 && !file.data.includes(0)
         ? file.data.toString('utf8')
         : undefined;
     return {
       id,
       name: file.name,
       kind,
+      mime,
       revision: file.revision,
       editable: file.writable && text !== undefined,
       text,

@@ -1,4 +1,4 @@
-import {WorkspaceDocuments,documentEvents} from './documents.js';
+import {WorkspaceDocuments,documentEvents,HTML_PREVIEW_CSP,HTML_PREVIEW_SHELL} from './documents.js';
 import {previewTimeline} from './timeline.js';
 import {approvalHistory} from '../approvals/lifecycle.js';
 import {parseApprovalComment} from '../approvals/deadlines.js';
@@ -75,7 +75,7 @@ export async function startWorkspaceServer(
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader(
       'Content-Security-Policy',
-      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; media-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
     );
     const json = (value: unknown, status = 200) => {
       res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -130,6 +130,12 @@ export async function startWorkspaceServer(
       }
       const principal = await auth.authorize(req, !['GET', 'HEAD'].includes(method), res);
       if (!(await isOwner(principal.ownerId))) throw new WorkspaceError(403, 'Owner access has been revoked.');
+      if (route === '/api/document-preview' && method === 'GET') {
+        res.setHeader('Content-Security-Policy', HTML_PREVIEW_CSP);
+        res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end(HTML_PREVIEW_SHELL);
+      }
       const documentRoute=/^\/api\/sessions\/([^/]+)\/documents(?:\/([a-f0-9]+)(\/content)?)?$/.exec(route);
       if(documentRoute){const [,session,id,content]=documentRoute;
         if(method==='POST'&&!id)return json(await documents.open(session,await body(req)));

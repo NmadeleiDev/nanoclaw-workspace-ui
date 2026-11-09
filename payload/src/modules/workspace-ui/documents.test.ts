@@ -85,6 +85,83 @@ it('keeps attachments read-only and rejects attachments from other chats', async
   await expect(docs.save('one', doc.id, 'changed', doc.revision)).rejects.toThrow('read-only');
 });
 
+it.each([
+  ['clip.mp4', 'video', 'video/mp4'],
+  ['clip.webm', 'video', 'video/webm'],
+  ['clip.mov', 'video', 'video/quicktime'],
+  ['picture.svg', 'image', 'image/svg+xml'],
+  ['picture.JPG', 'image', 'image/jpeg'],
+])('recognizes %s media previews', async (name, kind, mime) => {
+  fs.writeFileSync(path.join(root, name), 'fixture');
+  expect(await docs.open('one', { path: name })).toMatchObject({ kind, mime, editable: false });
+});
+
+it.each(['video/mp4', 'image/png'])('recognizes extensionless %s attachments', async (mime) => {
+  fs.mkdirSync(path.join(files, 'one'));
+  fs.writeFileSync(path.join(files, 'one', 'media'), 'fixture');
+  await store.db.run(
+    'INSERT INTO ws_files(id,session_id,filename,path,mime) VALUES(?,?,?,?,?)',
+    'media',
+    'one',
+    'download',
+    'owned:one/media',
+    mime,
+  );
+  expect(await docs.open('one', { attachmentId: 'media' })).toMatchObject({
+    kind: mime.split('/')[0],
+    mime,
+    editable: false,
+  });
+});
+
+it.each(['page.html', 'page.HTM'])(
+  'previews and edits full HTML from %s without losing the document structure',
+  async (name) => {
+    const html =
+      '<!doctype html><html><head><style>body{color:red}</style></head><body><button onclick="this.textContent=2">1</button></body></html>';
+    fs.writeFileSync(path.join(root, name), html);
+    const doc = await docs.open('one', { path: name });
+    expect(doc).toMatchObject({ kind: 'html', text: html, editable: true });
+    const saved = await docs.save('one', doc.id, html.replace('color:red', 'color:blue'), doc.revision);
+    expect(saved.kind).toBe('html');
+    expect(saved.text).toContain('color:blue');
+    expect(saved.revision).not.toBe(doc.revision);
+  },
+);
+
+it('recognizes HTML attachments by MIME type and keeps them read-only', async () => {
+  fs.mkdirSync(path.join(files, 'one'));
+  fs.writeFileSync(path.join(files, 'one', 'page'), '<!doctype html><h1>Attachment</h1>');
+  await store.db.run(
+    'INSERT INTO ws_files(id,session_id,filename,path,mime) VALUES(?,?,?,?,?)',
+    'html-attachment',
+    'one',
+    'download',
+    'owned:one/page',
+    'text/html; charset=utf-8',
+  );
+  expect(await docs.open('one', { attachmentId: 'html-attachment' })).toMatchObject({
+    kind: 'html',
+    editable: false,
+    text: '<!doctype html><h1>Attachment</h1>',
+  });
+  await expect(docs.open('two', { attachmentId: 'html-attachment' })).rejects.toThrow('another conversation');
+});
+
+it('keeps binary and oversized HTML out of the renderer while preserving download', async () => {
+  for (const [name, data] of [
+    ['binary.html', Buffer.from('<html>\0</html>')],
+    ['large.html', Buffer.alloc(2 * 1024 * 1024 + 1, 'a')],
+  ] as const) {
+    fs.writeFileSync(path.join(root, name), data);
+    const doc = await docs.open('one', { path: name });
+    expect(doc).toMatchObject({ kind: 'html', editable: false, text: undefined });
+    const download = await docs.download('one', doc.id);
+    expect(fs.readFileSync(download.fd!)).toEqual(data);
+    fs.closeSync(download.fd!);
+  }
+});
+
 it('preserves restricted file modes and reports removed files explicitly', async () => {
   fs.chmodSync(path.join(root, 'spec.md'), 0o600);
   const doc = await docs.open('one', { path: 'spec.md' });

@@ -1,7 +1,7 @@
 import { beforeEach, afterEach, it, expect, vi } from 'vitest';
 import { initTestDb, closeDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
-import './migration.js';
+import { workspaceInboundSequenceRecovery } from './migration.js';
 import { WorkspaceStore } from './store.js';
 import { WorkspaceService } from './service.js';
 import { messageGroups } from './activity.js';
@@ -15,6 +15,7 @@ vi.mock('../../session-manager.js', async () => ({
   ...(await vi.importActual('../../session-manager.js')),
   withExistingMailboxSession: async (_a: string, _s: string, fn: (box: any) => unknown) =>
     fn({
+      getTask: () => undefined,
       getWorkspaceInbound: () => [],
       getWorkspaceOutbound: (after: number) => fake.out.filter((r) => r.seq > after).slice(0, fake.limit),
       getWorkspaceEvents: (after: number) => fake.events.filter((r) => r.seq > after),
@@ -187,4 +188,39 @@ it('archives interrupted tools once when a runtime ends without a terminal event
   const history = await store.history('s');
   expect(history.messages.filter(m => m.kind === 'activity')).toHaveLength(1);
   expect(history.messages.find(m => m.kind === 'activity')?.data).toMatchObject({partialText:'partial',phase:'interrupted'});
+});
+
+it.each([262, 500])('recovers skipped inbound history below cursor %i once, without duplicates or outgoing replay', async (oldCursor) => {
+  const session = await store.getSession('s');
+  fake.incoming = [message('existing', 210, 'Already visible')];
+  fake.out = [message('reply', 219, 'Already delivered')];
+  await service.collect(session);
+  const revision = await store.historyRevision('s');
+  fake.incoming.push(message('missing', 212, 'Was skipped'), {
+    ...message('answer', 214, ''), kind: 'system',
+    content: JSON.stringify({type:'question_response',questionId:'question',selectedOption:'yes',userId:'owner'}),
+  }, message('latest', 400, 'Newer message'));
+  await store.db.run("UPDATE ws_cursors SET cursor=? WHERE direction IN ('in','question-history-in')", oldCursor);
+  await store.db.run('DELETE FROM schema_version WHERE name=?', workspaceInboundSequenceRecovery.name);
+  const outgoingBefore = await store.db.all("SELECT direction,cursor FROM ws_cursors WHERE direction NOT IN ('in','question-history-in') ORDER BY direction");
+  await runMigrations(store.db);
+  expect(await store.db.all("SELECT direction,cursor FROM ws_cursors WHERE direction NOT IN ('in','question-history-in') ORDER BY direction")).toEqual(outgoingBefore);
+  // Recovery spans batches and survives a collector restart.
+  fake.limit = 1;
+  await service.collect(session);
+  await service.stop();
+  service = new WorkspaceService(store);
+  for (let page = 0; page < 4; page++) await service.collect(session);
+  const recovered = await store.history('s');
+  expect(recovered.messages.filter(m => m.role === 'user').map(m => m.id).sort()).toEqual([
+    's:in:existing', 's:in:latest', 's:in:missing', 's:question-response:question',
+  ]);
+  expect(recovered.messages.filter(m => m.role === 'assistant').map(m => m.id)).toEqual(['s:out:reply']);
+  expect(await store.historyRevision('s')).toBeGreaterThan(revision);
+  expect(await store.db.all('SELECT * FROM ws_activity')).toHaveLength(0);
+  const cursors = await store.db.all('SELECT direction,cursor FROM ws_cursors ORDER BY direction');
+  await runMigrations(store.db);
+  expect(await store.db.all('SELECT direction,cursor FROM ws_cursors ORDER BY direction')).toEqual(cursors);
+  await service.collect(session);
+  expect((await store.history('s')).messages).toEqual(recovered.messages);
 });
